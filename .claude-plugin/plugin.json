@@ -1,0 +1,1 @@
+{ "name": "usage-stats", "version": "0.1.0", "description": "Pane, status line and /usage-stats command showing rate limits, context fill, cost and tokens", "types": "./types/index.d.ts" }
