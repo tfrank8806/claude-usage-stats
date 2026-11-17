@@ -139,6 +139,8 @@ test(
     }
     const writes: string[] = []
     mock.store(on, { 'day:2026-11-16:me-earlier': entry(1.5) })
+    const runs: string[][] = []
+    on('process.run', (_, e) => (runs.push([...e.argv]), { value: { exitCode: 0, stdout: '', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }))
     on('env.get', (_, e) => ({ value: e.name === 'HOME' ? '/home/t' : undefined }))
     on('fs.write', (_, e) => {
       files[e.path] = e.text
@@ -173,6 +175,8 @@ test(
     const written = JSON.parse(files[mine]!)
     expect(written.machine).toBe('laptop')
     expect(Object.keys(written.entries)).toEqual(['day:2026-11-16:me-earlier'])
+    // Readable by the group, so another machine's user can read it through a share.
+    expect(runs).toEqual([['chmod', 'g+r', mine]])
 
     const r = await $.command.run({ ...HISTORY })
     const text = (r as { text: string }).text
@@ -238,3 +242,30 @@ test('without a sync folder nothing is written outside the store', async ($, on)
   expect(text).toContain('this machine')
   expect(text).toContain('Set the syncFolder option')
 })
+
+test(
+  'on a Windows sync folder the file is written there and no chmod runs',
+  { options: { syncFolder: 'S:\\files\\Claude Sync Folder', machineName: 'laptop' } },
+  async ($, on) => {
+    mock.clock(on, { now: NOON })
+    mock.store(on, {})
+    const writes: string[] = []
+    const runs: string[][] = []
+    on('fs.write', (_, e) => (writes.push(e.path), { value: undefined }))
+    on('fs.list', () => ({ value: [] }))
+    on('process.run', (_, e) => (runs.push([...e.argv]), { value: { exitCode: 0, stdout: '', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }))
+    on('env.get', () => ({ value: undefined }))
+    on('session.usage', () => ({ value: { startedAt: NOON, context: { window: 200000 }, rateLimits: [], cost: { usd: 0 } } }))
+    on('session.id', () => ({ value: 'me' }))
+    on('command.register', () => ({ value: { command: 'usage-stats' } }))
+    on('ui.status', () => ({ value: undefined }))
+    on('session.start', (_, e) => ({ cwd: e.cwd }))
+
+    await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+    expect(writes.length).toBe(1)
+    // A Linux test host reads `S:\\…` as relative and puts its own directory before it; on
+    // Windows it is the absolute path. Either way the file is in the folder, by this machine's id.
+    expect(writes[0]).toMatch(/S:\\files\\Claude Sync Folder\\usage-[a-z0-9]{12}\.json$/)
+    expect(runs).toEqual([])
+  },
+)

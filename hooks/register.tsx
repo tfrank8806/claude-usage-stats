@@ -275,7 +275,12 @@ async function syncFolder(
     entries: own,
   }
   try {
-    await $.fs.write(`${where.dir}${where.sep}usage-${id}.json`, JSON.stringify(file))
+    const ownPath = `${where.dir}${where.sep}usage-${id}.json`
+    await $.fs.write(ownPath, JSON.stringify(file))
+    // The file is written owner-only (0600), which on a shared folder also zeroes the
+    // ACL mask, so the other machines' users (e.g. through Samba) cannot read it.
+    // Let the group read it: that lifts the mask to r-- and leaves "other" untouched.
+    if (where.sep === '/') await $.process.run(['chmod', 'g+r', ownPath]).catch(() => undefined)
     const found: Record<string, MachineFile> = {}
     const problems: string[] = []
     for (const f of await $.fs.list(where.dir)) {
