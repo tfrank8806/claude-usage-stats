@@ -140,6 +140,8 @@ declare module 'claude-code' {
       /** Other machines' files as last read from the sync folder, by machine id. */
       remote: Shaped<Record<string, MachineFile>>
       sync: Shaped<SyncStatus | null>
+      /** Which view of the pane is showing: now, value, history or machines. */
+      tab: Shaped<string>
     }
   }
 }

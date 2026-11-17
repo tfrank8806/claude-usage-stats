@@ -10,6 +10,46 @@ const HISTORY = {
   presentation: { isFullscreen: false, columns: 100 },
 } as const
 
+type Surface = 'terminal' | 'desktop' | 'vscode' | 'mobile'
+const SURFACES = ['terminal', 'desktop', 'vscode', 'mobile'] as const
+/** Mounts the pane on a surface, on the given tab. */
+const mountPane = async ($: Parameters<TestBody>[0], surface: Surface, view = 'now') => {
+  const ui = await $.ui.mount({
+    plugin: 'usage-stats',
+    component: 'Pane',
+    requestId: 'usage-stats',
+    surface,
+    props: { title: 'Claude usage', isFocused: false, bodyColumns: 100, placement: 'dock', scroll: { offset: 0, bodyRows: 90 }, view: {} },
+  })
+  if (view !== 'now') await ui.select({ key: 'tab', value: view })
+  return ui
+}
+type Pane = Awaited<ReturnType<typeof mountPane>>
+/** The value beside a row's label, or undefined when no row has that label. */
+const rowValue = async (ui: Pane, name: string) => {
+  const texts = await ui.findAll({ type: 'Text' })
+  const at = texts.findIndex(x => x.text === name)
+  return at < 0 ? undefined : texts[at + 1]?.text
+}
+/**
+ * A meter by its label: the figure beside it, how full its bar is (percent, 0 when empty)
+ * and the fill's color; undefined when no meter has that label.
+ */
+const bar = async (ui: Pane, name: string) => {
+  const all = await ui.findAll({})
+  const at = all.findIndex(x => x.type === 'Text' && x.text === name)
+  if (at < 0) return undefined
+  const track = all.findIndex((x, i) => i > at && x.type === 'Box' && x.props.backgroundColor === 'gray' && x.props.height === 1)
+  if (track < 0 || track > at + 4) return undefined
+  const fill = all[track + 1]
+  const isFill = fill?.type === 'Box' && fill.props.height === 1 && typeof fill.props.width === 'string'
+  return {
+    valueText: all[at + 1]?.text,
+    fill: isFill ? Number.parseFloat(String(fill.props.width)) : 0,
+    color: isFill ? fill.props.backgroundColor : undefined,
+  }
+}
+
 const usage = (model: string, output: number) => ({
   model,
   input_tokens: 100,
@@ -102,18 +142,13 @@ test('the pane draws history on every surface', async ($, on) => {
   on('ui.status', () => ({ value: undefined }))
   await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
 
-  for (const surface of ['terminal', 'desktop', 'vscode', 'mobile'] as const) {
-    const ui = await $.ui.mount({
-      plugin: 'usage-stats',
-      component: 'Pane',
-      requestId: 'usage-stats',
-      surface,
-      props: { title: 'Claude usage', isFocused: false, bodyColumns: 80, placement: 'dock', scroll: { offset: 0, bodyRows: 60 }, view: {} },
-    })
-    expect((await ui.find({ type: 'Text', text: /^History/ }))?.text).toContain('since 2026-11-16')
-    expect((await ui.find({ type: 'Text', text: /^Today/ }))?.text).toContain('$1.50')
-    expect((await ui.find({ type: 'Text', text: /^opus-5-5/ }))?.text).toContain('100%')
-    expect((await ui.find({ type: 'Text', text: /^11-16/ }))?.text).toContain('peak 5-hour 40%')
+  for (const surface of SURFACES) {
+    const ui = await mountPane($, surface, 'history')
+    expect((await ui.find({ type: 'Text', text: /^Since / }))?.text).toBe('Since Nov 16 · this machine')
+    expect(await rowValue(ui, 'Today')).toBe('$1.50 · 2 turns · 2.0k out · 1 sess')
+    expect((await bar(ui, 'opus-5-5'))?.valueText).toBe('100% · 2 turns · 2.0k out')
+    expect((await bar(ui, 'Nov 16'))?.valueText).toBe('$1.50 · peak 5-hour 40%')
+    expect((await bar(ui, 'Nov 16'))?.fill).toBe(100)
     await ui.unmount()
   }
 })
@@ -192,19 +227,19 @@ test(
     expect(text).toContain('Sync problem: skipped usage-bad00001.json')
     expect(text).not.toContain('notes.txt')
 
-    for (const surface of ['terminal', 'desktop', 'vscode', 'mobile'] as const) {
-      const ui = await $.ui.mount({
-        plugin: 'usage-stats',
-        component: 'Pane',
-        requestId: 'usage-stats',
-        surface,
-        props: { title: 'Claude usage', isFocused: false, bodyColumns: 100, placement: 'dock', scroll: { offset: 0, bodyRows: 80 }, view: {} },
-      })
-      expect((await ui.find({ type: 'Text', text: /^History/ }))?.text).toContain('3 machines')
-      expect((await ui.find({ type: 'Text', text: /^\* laptop/ }))?.text).toContain('(this machine)')
-      expect((await ui.find({ type: 'Text', text: /^ {2}desktop/ }))?.text).toContain('synced 1h 0m ago')
+    for (const surface of SURFACES) {
+      // The sync problem shows on every view; the machines are on their own tab.
+      const now = await mountPane($, surface)
+      expect((await now.find({ type: 'Text', text: /^Sync problem/ }))?.text).toContain('usage-bad00001.json')
+      await now.unmount()
+      const ui = await mountPane($, surface, 'machines')
+      expect(await rowValue(ui, 'laptop (this machine)')).toBe('$1.50 · 1 turns')
+      expect(await rowValue(ui, 'desktop')).toBe('$2.00 · 1 turns · synced 1h 0m ago')
       expect((await ui.find({ type: 'Text', text: /^Sync problem/ }))?.text).toContain('usage-bad00001.json')
       await ui.unmount()
+      const history = await mountPane($, surface, 'history')
+      expect((await history.find({ type: 'Text', text: /^Since / }))?.text).toContain('3 machines')
+      await history.unmount()
     }
 
     // A turn within two minutes doesn't rewrite the file; the refresh at the two-minute mark
@@ -311,15 +346,9 @@ test(
     })
     await clock.advance(2 * 60 * 1000)
 
-    const ui = await $.ui.mount({
-      plugin: 'usage-stats',
-      component: 'Pane',
-      requestId: 'usage-stats',
-      surface: 'desktop',
-      props: { title: 'Claude usage', isFocused: false, bodyColumns: 100, placement: 'dock', scroll: { offset: 0, bodyRows: 80 }, view: {} },
-    })
-    expect((await ui.find({ type: 'Text', text: /^History/ }))?.text).toContain('2 machines')
-    expect((await ui.find({ type: 'Text', text: /^Today/ }))?.text).toContain('$3.00')
+    const ui = await mountPane($, 'desktop', 'history')
+    expect((await ui.find({ type: 'Text', text: /^Since / }))?.text).toContain('2 machines')
+    expect(await rowValue(ui, 'Today')).toMatch(/^\$3\.00 · /)
     await ui.unmount()
 
     // Nothing changed here, so idle refreshes don't rewrite this machine's file...
@@ -437,18 +466,13 @@ test('value: a billing day without a price measures that period', { options: { b
 
 test('value: with no price the pane shows the cost, no break-even bar, on every surface', async ($, on) => {
   await valueText($, on, STORE)
-  for (const surface of ['terminal', 'desktop', 'vscode', 'mobile'] as const) {
-    const ui = await $.ui.mount({
-      plugin: 'usage-stats',
-      component: 'Pane',
-      requestId: 'usage-stats',
-      surface,
-      props: { title: 'Claude usage', isFocused: false, bodyColumns: 100, placement: 'dock', scroll: { offset: 0, bodyRows: 90 }, view: {} },
-    })
+  for (const surface of SURFACES) {
+    const ui = await mountPane($, surface, 'value')
     expect((await ui.find({ type: 'Text', text: /^API-equivalent cost$/ }))?.text).toBe('API-equivalent cost')
-    expect((await ui.find({ type: 'Text', text: /^API-equivalent so far/ }))?.text).toBe('API-equivalent so far  $1129.00')
+    expect(await rowValue(ui, 'API-equivalent so far')).toBe('$1129.00')
+    expect(await rowValue(ui, 'Projected this period')).toBe('$2116.88')
     expect((await ui.find({ type: 'Text', text: /^Add your plan price/ }))?.text).toContain('/plugin configure')
-    expect(await ui.find({ type: 'Text', text: /of break-even$/ })).toBeUndefined()
+    expect(await bar(ui, 'Toward break-even')).toBeUndefined()
     expect(await ui.find({ type: 'Text', text: /^Subscription value/ })).toBeUndefined()
     await ui.unmount()
   }
@@ -456,17 +480,15 @@ test('value: with no price the pane shows the cost, no break-even bar, on every 
 
 test('value: the pane draws the section on every surface', { options: { subscriptionUsd: 100, billingDay: 5 } }, async ($, on) => {
   await valueText($, on, STORE)
-  for (const surface of ['terminal', 'desktop', 'vscode', 'mobile'] as const) {
-    const ui = await $.ui.mount({
-      plugin: 'usage-stats',
-      component: 'Pane',
-      requestId: 'usage-stats',
-      surface,
-      props: { title: 'Claude usage', isFocused: false, bodyColumns: 100, placement: 'dock', scroll: { offset: 0, bodyRows: 90 }, view: {} },
-    })
+  for (const surface of SURFACES) {
+    const ui = await mountPane($, surface, 'value')
     expect((await ui.find({ type: 'Text', text: /^Subscription value/ }))?.text).toBe('Subscription value')
-    expect((await ui.find({ type: 'Text', text: /^API-equivalent so far/ }))?.text).toContain('1.30×')
-    expect((await ui.find({ type: 'Text', text: /of break-even$/ }))?.text).toContain('130% of break-even')
+    expect(await rowValue(ui, 'API-equivalent so far')).toBe('$130.00  = 1.30× the plan')
+    expect(await rowValue(ui, 'Break-even')).toBe('reached Nov 10')
+    const toward = await bar(ui, 'Toward break-even')
+    expect(toward?.valueText).toBe('130% of $100.00')
+    expect(toward?.fill).toBe(100)
+    expect(toward?.color).toBe('green')
     await ui.unmount()
   }
 })
@@ -601,14 +623,8 @@ test('settings: the pane shows the command everywhere and a button where it can 
   on('prompt.fill', (_, e) => (fills.push(e.text), { isFilled: true }))
   on('ui.toast', (_, e) => (toasts.push(String(e.text)), { value: undefined }))
   await valueText($, on, STORE)
-  for (const surface of ['terminal', 'desktop', 'vscode', 'mobile'] as const) {
-    const ui = await $.ui.mount({
-      plugin: 'usage-stats',
-      component: 'Pane',
-      requestId: 'usage-stats',
-      surface,
-      props: { title: 'Claude usage', isFocused: false, bodyColumns: 100, placement: 'dock', scroll: { offset: 0, bodyRows: 90 }, view: {} },
-    })
+  for (const surface of SURFACES) {
+    const ui = await mountPane($, surface)
     expect((await ui.find({ type: 'Text', text: /^Settings: / }))?.text).toContain('/plugin configure usage-stats@claude-usage-stats')
     if (surface === 'terminal' || surface === 'desktop') {
       await ui.press({ key: 'settings' })
@@ -629,4 +645,51 @@ test('settings: /usage-stats settings fills the prompt, or names the command whe
   expect(await run()).toBe('Press Enter to open the settings.')
   isFilled = false
   expect(await run()).toBe('Run /plugin configure usage-stats@claude-usage-stats to open the settings.')
+})
+
+test('ui: the Now tab draws limit bars colored by level, with countdown and pace', async ($, on) => {
+  const clock = mock.clock(on, { now: NOON })
+  mock.store(on, {})
+  let limits = [
+    { kind: 'five_hour', percentUsed: 40, resetsAt: new Date(NOON + 2 * 3.6e6).toISOString() },
+    { kind: 'seven_day', percentUsed: 92, resetsAt: new Date(NOON + 3 * 864e5).toISOString() },
+  ]
+  on('session.usage', () => ({
+    value: { startedAt: NOON, context: { window: 200000, tokens: 150000, percent: 75 }, rateLimits: limits, cost: { usd: 1.25 } },
+  }))
+  on('session.id', () => ({ value: 'me' }))
+  on('command.register', () => ({ value: { command: 'usage-stats' } }))
+  on('ui.status', () => ({ value: undefined }))
+  on('ui.toast', () => ({ value: undefined }))
+  on('ui.open', () => ({ value: { isPlaced: true } }))
+  on('session.start', (_, e) => ({ cwd: e.cwd }))
+  await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: false })
+  await clock.set(NOON + 30 * 60 * 1000)
+  limits = limits.map(l => (l.kind === 'five_hour' ? { ...l, percentUsed: 50 } : l))
+  await $.command.run({ ...HISTORY, args: '' }) // a fresh reading, as the refresh takes one
+
+  for (const surface of SURFACES) {
+    const ui = await mountPane($, surface)
+    const five = await bar(ui, '5-hour')
+    expect(five?.fill).toBe(50)
+    expect(five?.valueText).toBe('50% · resets in 1h 30m')
+    expect(five?.color).toBe('green')
+    const week = await bar(ui, 'Weekly')
+    expect(week?.color).toBe('red')
+    // 40% → 50% in 30 minutes is 20%/h: full in 2h 30m, after the reset in 1h 30m.
+    expect((await ui.find({ type: 'Text', text: /^At 20\.0%\/h/ }))?.text).toBe("At 20.0%/h, won't fill before reset")
+    expect((await bar(ui, 'Context'))?.color).toBe('yellow')
+    expect(await rowValue(ui, 'Cost')).toBe('$1.25')
+    expect(await rowValue(ui, 'Pace')).toBe('$2.50/h over 30m')
+    await ui.unmount()
+  }
+})
+
+test('ui: the Machines tab is offered only with a sync folder', async ($, on) => {
+  await valueText($, on, STORE)
+  const ui = await mountPane($, 'desktop')
+  const select = await ui.find({ type: 'Select' })
+  const values = (select?.props.options as { value: string }[]).map(o => o.value)
+  expect(values).toEqual(['now', 'value', 'history'])
+  await ui.unmount()
 })
