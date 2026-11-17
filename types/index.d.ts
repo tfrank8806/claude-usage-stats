@@ -30,7 +30,31 @@ export type DayEntry = ModelTally & {
 export type Totals = ModelTally & { costUsd: number; sessions: number; activeDays: number }
 /** One day's row in the daily chart. */
 export type DayRow = { day: string; costUsd: number; output: number; turns: number; sessions: number; peaks: Record<string, number> }
-/** The history the pane draws, summed from $.store. */
+/**
+ * One machine's file in the shared sync folder, `usage-<machineId>.json`.
+ * Only that machine ever writes it, so file-sync services never see two writers.
+ */
+export type MachineFile = {
+  version: 1
+  machineId: string
+  machine: string
+  updatedAt: number
+  /** Its store entries, keyed as in the store (`day:<YYYY-MM-DD>:<sessionId>`). */
+  entries: Record<string, DayEntry>
+}
+/** One machine's line in the per-machine breakdown. */
+export type MachineRow = {
+  machineId: string
+  machine: string
+  isThis: boolean
+  /** When its file was last written; absent for this machine (always current). */
+  updatedAt?: number
+  month: Totals
+  all: Totals
+}
+/** Where sync stands: the folder, when it last ran, and what went wrong if it failed. */
+export type SyncStatus = { folder: string; lastAt?: number; error?: string }
+/** The history the pane draws, summed from $.store and the sync folder. */
 export type History = {
   today: Totals
   week: Totals
@@ -39,6 +63,8 @@ export type History = {
   firstDay?: string
   recent: DayRow[]
   models30: Record<string, ModelTally>
+  machines: MachineRow[]
+  sync?: SyncStatus
 }
 /** What this session has already written to history, so each turn adds only what is new. */
 export type Ledger = { lastCostUsd: number }
@@ -51,6 +77,9 @@ declare module 'claude-code' {
       samples: Shaped<Record<string, Sample[]>>
       history: Shaped<History | null>
       ledger: Shaped<Ledger | null>
+      /** Other machines' files as last read from the sync folder, by machine id. */
+      remote: Shaped<Record<string, MachineFile>>
+      sync: Shaped<SyncStatus | null>
     }
   }
 }

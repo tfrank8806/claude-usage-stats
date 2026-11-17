@@ -7,6 +7,8 @@ import type {
   History,
   Ledger,
   Limit,
+  MachineFile,
+  MachineRow,
   ModelTally,
   Sample,
   Snapshot,
@@ -21,12 +23,15 @@ const PACE_WINDOW_MS = 60 * 60 * 1000 // judge the burn rate on the last hour of
 const KEEP_DAYS = 180 // history older than this is pruned from the store
 const CHART_DAYS = 14
 const DAY_PREFIX = 'day:'
+const SYNC_EVERY_MS = 2 * 60 * 1000 // write and read the sync folder at most this often, but always at start and end
 
 const snapshot = atom({ plugin: 'usage-stats', key: 'snapshot' } as const, null, { shape: 'snap-2' })
 const tokens = atom({ plugin: 'usage-stats', key: 'tokens' } as const, ZERO, { shape: 'tok-2' })
 const samples = atom({ plugin: 'usage-stats', key: 'samples' } as const, {}, { shape: 'samp-1' })
-const history = atom({ plugin: 'usage-stats', key: 'history' } as const, null, { shape: 'hist-1' })
+const history = atom({ plugin: 'usage-stats', key: 'history' } as const, null, { shape: 'hist-2' })
 const ledger = atom({ plugin: 'usage-stats', key: 'ledger' } as const, null, { shape: 'ledger-1' })
+const remote = atom({ plugin: 'usage-stats', key: 'remote' } as const, {}, { shape: 'remote-1' })
+const sync = atom({ plugin: 'usage-stats', key: 'sync' } as const, null, { shape: 'sync-1' })
 
 const LABEL: Record<string, string> = { five_hour: '5-hour', seven_day: 'Weekly', spend_limit: 'Spend' }
 const label = (kind: string) => LABEL[kind] ?? kind
@@ -42,6 +47,7 @@ const dur = (ms: number) => {
   const m = Math.floor((ms % 3.6e6) / 6e4)
   return hrs >= 24 ? `${Math.floor(hrs / 24)}d ${hrs % 24}h` : hrs > 0 ? `${hrs}h ${m}m` : `${m}m`
 }
+const ago = (ms: number) => (ms < 6e4 ? '<1m' : dur(ms))
 const two = (n: number) => String(n).padStart(2, '0')
 const clock = (t: number) => {
   const d = new Date(t)
@@ -191,28 +197,164 @@ async function recordTurn($: EngineInterface, u: RawUsage & { model: string }, n
   await $.store.set(key, entry)
 }
 
-// Sum every stored entry into what the pane draws, pruning entries past KEEP_DAYS.
-async function loadHistory($: EngineInterface, now: number) {
-  const keys = (await $.store.keys()).filter(key => key.startsWith(DAY_PREFIX))
+type SyncOptions = { folder: string; machineName: string; force: boolean }
+
+const isRecord = (v: unknown): v is Record<string, unknown> => !!v && typeof v === 'object' && !Array.isArray(v)
+
+/** This machine's id, made once and kept in the store. */
+async function machineIdOf($: EngineInterface) {
+  const kept = await $.store.get('machineId')
+  if (typeof kept === 'string' && /^[a-z0-9]{6,32}$/.test(kept)) return kept
+  let id = ''
+  while (id.length < 12) id += Math.floor(Math.random() * 36).toString(36)
+  await $.store.set('machineId', id)
+  return id
+}
+
+/** The name shown for this machine: the setting, else the host's name, else its id. */
+async function machineNameOf($: EngineInterface, setting: string, id: string) {
+  const named = setting.trim() || (await $.env.get('HOSTNAME')) || (await $.env.get('COMPUTERNAME')) || ''
+  return named.trim() || `machine-${id.slice(0, 4)}`
+}
+
+/** The sync folder as an absolute path with its separator, `~` expanded; undefined when unset. */
+async function syncDirOf($: EngineInterface, folder: string) {
+  let dir = folder.trim()
+  if (!dir) return undefined
+  if (dir === '~' || dir.startsWith('~/') || dir.startsWith('~\\')) {
+    const home = (await $.env.get('HOME')) ?? (await $.env.get('USERPROFILE'))
+    if (!home) return undefined
+    dir = home + dir.slice(1)
+  }
+  const sep = dir.includes('\\') && !dir.includes('/') ? '\\' : '/'
+  return { dir: dir.replace(/[\\/]+$/, ''), sep }
+}
+
+const FILE_RE = /^usage-([a-z0-9]{6,32})\.json$/
+
+/** Reads one machine's file, or undefined when it is not one this plugin wrote. */
+const asMachineFile = (v: unknown): MachineFile | undefined => {
+  if (!isRecord(v) || v.version !== 1 || typeof v.machineId !== 'string' || !isRecord(v.entries)) return undefined
+  const entries: Record<string, DayEntry> = {}
+  for (const [key, e] of Object.entries(v.entries)) {
+    const entry = asEntry(e)
+    if (entry && key.startsWith(DAY_PREFIX)) entries[key] = entry
+  }
+  return {
+    version: 1,
+    machineId: v.machineId,
+    machine: typeof v.machine === 'string' ? v.machine : v.machineId,
+    updatedAt: typeof v.updatedAt === 'number' ? v.updatedAt : 0,
+    entries,
+  }
+}
+
+// Write this machine's file to the sync folder and read every other machine's.
+// Throttled to once per SYNC_EVERY_MS unless forced; a failure keeps the last good read.
+async function syncFolder(
+  $: EngineInterface,
+  own: Record<string, DayEntry>,
+  opts: SyncOptions,
+  now: number,
+) {
+  const where = await syncDirOf($, opts.folder)
+  if (!where) {
+    await update($, sync, () => null)
+    await update($, remote, () => ({}))
+    return
+  }
+  const prev = await read($, sync)
+  const isDue = opts.force || !prev || prev.folder !== where.dir || now - (prev.lastAt ?? 0) >= SYNC_EVERY_MS
+  if (!isDue) return
+  const id = await machineIdOf($)
+  const file: MachineFile = {
+    version: 1,
+    machineId: id,
+    machine: await machineNameOf($, opts.machineName, id),
+    updatedAt: now,
+    entries: own,
+  }
+  try {
+    await $.fs.write(`${where.dir}${where.sep}usage-${id}.json`, JSON.stringify(file))
+    const found: Record<string, MachineFile> = {}
+    const problems: string[] = []
+    for (const f of await $.fs.list(where.dir)) {
+      const m = FILE_RE.exec(f.name)
+      if (f.kind !== 'file' || !m || m[1] === id) continue
+      try {
+        const other = asMachineFile(JSON.parse(await $.fs.read(`${where.dir}${where.sep}${f.name}`)))
+        if (other) found[other.machineId] = other
+        else problems.push(`${f.name}: not a usage file`)
+      } catch (err) {
+        problems.push(`${f.name}: ${err instanceof Error ? err.message : String(err)}`)
+      }
+    }
+    await update($, remote, () => found)
+    await update($, sync, () => ({
+      folder: where.dir,
+      lastAt: now,
+      error: problems.length ? `skipped ${problems.join('; ')}` : undefined,
+    }))
+  } catch (err) {
+    await update($, sync, () => ({
+      folder: where.dir,
+      lastAt: now,
+      error: err instanceof Error ? err.message : String(err),
+    }))
+  }
+}
+
+// Sum this machine's stored entries and every synced machine's into what the pane
+// draws, pruning this machine's entries past KEEP_DAYS.
+async function loadHistory($: EngineInterface, now: number, opts: SyncOptions) {
   const today = dayOf(now)
   const weekFrom = daysBefore(now, 6)
   const monthFrom = daysBefore(now, 29)
   const chartFrom = daysBefore(now, CHART_DAYS - 1)
   const pruneBefore = daysBefore(now, KEEP_DAYS)
 
-  const spans = { today: { ...NO_TOTALS }, week: { ...NO_TOTALS }, month: { ...NO_TOTALS }, all: { ...NO_TOTALS } }
-  const daysSeen = { today: new Set<string>(), week: new Set<string>(), month: new Set<string>(), all: new Set<string>() }
-  const rows: Record<string, DayRow> = {}
-  const models30: Record<string, ModelTally> = {}
-  let firstDay: string | undefined
-
-  for (const key of keys) {
+  // This machine's entries, from the store.
+  const own: Record<string, DayEntry> = {}
+  for (const key of (await $.store.keys()).filter(key => key.startsWith(DAY_PREFIX))) {
     const entry = asEntry(await $.store.get(key))
     if (!entry) continue
     if (entry.day < pruneBefore) {
       await $.store.delete(key)
       continue
     }
+    own[key] = entry
+  }
+
+  await syncFolder($, own, opts, now)
+  const others = (await read($, remote)) ?? {}
+  const status = (await read($, sync)) ?? undefined
+  const id = await machineIdOf($)
+  const name = status ? await machineNameOf($, opts.machineName, id) : 'this machine'
+
+  // Every entry once, by key: a session id is unique, so the same key in two files
+  // (a sync service's conflicted copy, a renamed machine) is one session.
+  const all = new Map<string, { entry: DayEntry; machineId: string }>()
+  for (const [key, entry] of Object.entries(own)) all.set(key, { entry, machineId: id })
+  for (const f of Object.values(others)) {
+    for (const [key, entry] of Object.entries(f.entries)) {
+      if (!all.has(key) && entry.day >= pruneBefore) all.set(key, { entry, machineId: f.machineId })
+    }
+  }
+
+  const spans = { today: { ...NO_TOTALS }, week: { ...NO_TOTALS }, month: { ...NO_TOTALS }, all: { ...NO_TOTALS } }
+  const daysSeen = { today: new Set<string>(), week: new Set<string>(), month: new Set<string>(), all: new Set<string>() }
+  const rows: Record<string, DayRow> = {}
+  const models30: Record<string, ModelTally> = {}
+  const perMachine: Record<string, { month: Totals; all: Totals }> = {}
+  let firstDay: string | undefined
+  const addTo = (t: Totals, entry: DayEntry): Totals => ({
+    ...sum(t, entry),
+    costUsd: t.costUsd + entry.costUsd,
+    sessions: t.sessions + 1,
+    activeDays: 0,
+  })
+
+  for (const { entry, machineId } of all.values()) {
     if (!firstDay || entry.day < firstDay) firstDay = entry.day
     const inSpan = {
       today: entry.day === today,
@@ -220,12 +362,13 @@ async function loadHistory($: EngineInterface, now: number) {
       month: entry.day >= monthFrom,
       all: true,
     }
-    for (const name of ['today', 'week', 'month', 'all'] as const) {
-      if (!inSpan[name]) continue
-      const t = spans[name]
-      spans[name] = { ...sum(t, entry), costUsd: t.costUsd + entry.costUsd, sessions: t.sessions + 1, activeDays: 0 }
-      daysSeen[name].add(entry.day)
+    for (const span of ['today', 'week', 'month', 'all'] as const) {
+      if (!inSpan[span]) continue
+      spans[span] = addTo(spans[span], entry)
+      daysSeen[span].add(entry.day)
     }
+    const pm = perMachine[machineId] ?? { month: { ...NO_TOTALS }, all: { ...NO_TOTALS } }
+    perMachine[machineId] = { month: inSpan.month ? addTo(pm.month, entry) : pm.month, all: addTo(pm.all, entry) }
     if (inSpan.month) {
       for (const [m, tally] of Object.entries(entry.byModel)) models30[m] = sum(models30[m] ?? EMPTY, tally)
     }
@@ -243,7 +386,7 @@ async function loadHistory($: EngineInterface, now: number) {
       }
     }
   }
-  for (const name of ['today', 'week', 'month', 'all'] as const) spans[name].activeDays = daysSeen[name].size
+  for (const span of ['today', 'week', 'month', 'all'] as const) spans[span].activeDays = daysSeen[span].size
 
   // One row per calendar day in the chart, empty days included, oldest first.
   const recent: DayRow[] = []
@@ -251,11 +394,30 @@ async function loadHistory($: EngineInterface, now: number) {
     const day = daysBefore(now, i)
     recent.push(rows[day] ?? { day, costUsd: 0, output: 0, turns: 0, sessions: 0, peaks: {} })
   }
-  const hx: History = { ...spans, firstDay, recent, models30 }
+
+  const machines: MachineRow[] = [
+    { machineId: id, machine: name, isThis: true, ...(perMachine[id] ?? { month: NO_TOTALS, all: NO_TOTALS }) },
+    ...Object.values(others)
+      .map(f => ({
+        machineId: f.machineId,
+        machine: f.machine,
+        isThis: false,
+        updatedAt: f.updatedAt,
+        ...(perMachine[f.machineId] ?? { month: NO_TOTALS, all: NO_TOTALS }),
+      }))
+      .sort((a, b) => b.month.costUsd - a.month.costUsd),
+  ]
+  const hx: History = { ...spans, firstDay, recent, models30, machines, sync: status }
   await update($, history, () => hx)
 }
 
-export const register: Register = on => {
+export const register: Register = (on, options) => {
+  const syncOpts = (force: boolean): SyncOptions => ({
+    folder: typeof options.syncFolder === 'string' ? options.syncFolder : '',
+    machineName: typeof options.machineName === 'string' ? options.machineName : '',
+    force,
+  })
+
   on('session.start', async ($, e, next) => {
     await $.command.register({
       name: 'usage-stats',
@@ -268,7 +430,7 @@ export const register: Register = on => {
     // Cost already on the ledger (a resumed session) was counted when it was spent.
     await update($, ledger, l => l ?? { lastCostUsd: u.cost?.usd ?? 0 })
     await recordSamples($, s.limits, now)
-    await loadHistory($, now)
+    await loadHistory($, now, syncOpts(true))
     $.ui.status(statusText(s, (await read($, samples)) ?? {}, now))
     return next(e)
   })
@@ -278,7 +440,7 @@ export const register: Register = on => {
     const s = toSnapshot(await $.session.usage(), now)
     await update($, snapshot, () => s)
     await recordSamples($, s.limits, now)
-    await loadHistory($, now)
+    await loadHistory($, now, syncOpts(true))
     await $.ui.open({ id: PANE, title: 'Claude usage' })
     if (e.args.trim() === 'history') {
       const hx = await read($, history)
@@ -287,11 +449,21 @@ export const register: Register = on => {
         `${name.padEnd(13)} ${usd(t.costUsd).padStart(9)}  ${String(t.turns).padStart(5)} turns  ${k(t.output).padStart(7)} out  ${t.sessions} sessions`
       return {
         text: [
-          `Usage history (since ${hx.firstDay ?? 'today'})`,
+          `Usage history (since ${hx.firstDay ?? 'today'}${hx.sync ? `, ${hx.machines.length} machine${hx.machines.length === 1 ? '' : 's'}` : ', this machine'})`,
           line('Today', hx.today),
           line('Last 7 days', hx.week),
           line('Last 30 days', hx.month),
           line(`All (${KEEP_DAYS}d max)`, hx.all),
+          ...(hx.sync
+            ? [
+                '',
+                `By machine, last 30 days (sync: ${hx.sync.folder})`,
+                ...hx.machines.map(m =>
+                  line(`${m.isThis ? '* ' : '  '}${m.machine}`.slice(0, 13), m.month) + (m.updatedAt ? `  (synced ${ago(now - m.updatedAt)} ago)` : ''),
+                ),
+                ...(hx.sync.error ? [`Sync problem: ${hx.sync.error}`] : []),
+              ]
+            : ['', 'This machine only. Set the syncFolder option to combine machines.']),
         ].join('\n'),
       }
     }
@@ -331,9 +503,15 @@ export const register: Register = on => {
       })
       const now = await $.clock.now()
       await recordTurn($, u, now)
-      await loadHistory($, now)
+      await loadHistory($, now, syncOpts(false))
     }
     return done
+  })
+
+  // A last write, so this session's final turns reach the other machines.
+  on('session.end', async ($, e, next) => {
+    if (syncOpts(true).folder.trim()) await loadHistory($, await $.clock.now(), syncOpts(true))
+    return next(e)
   })
 
   on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {
@@ -423,7 +601,13 @@ export const register: Register = on => {
         <Text>Input     {k(t.input)}  (cache read {k(t.cacheRead)}, write {k(t.cacheWrite)})</Text>
         <Text>Output    {k(t.output)}</Text>
         <Text> </Text>
-        <Text bold>History{hx?.firstDay ? ` (since ${hx.firstDay}, this machine)` : ''}</Text>
+        <Text bold>
+          History
+          {hx?.firstDay
+            ? ` (since ${hx.firstDay}, ${hx.sync ? `${hx.machines.length} machine${hx.machines.length === 1 ? '' : 's'}` : 'this machine'})`
+            : ''}
+        </Text>
+        {hx?.sync?.error && <Text color="red">Sync problem: {hx.sync.error}</Text>}
         {(!hx || hx.all.turns === 0) && <Text dimColor>Nothing recorded yet; history starts with your next reply.</Text>}
         {hx && hx.all.turns > 0 && (
           <Box flexDirection="column">
@@ -451,6 +635,19 @@ export const register: Register = on => {
                 </Text>
               )
             })}
+            {hx.sync && (
+              <Box flexDirection="column">
+                <Text> </Text>
+                <Text bold>By machine (last 30 days)</Text>
+                {hx.machines.map(m => (
+                  <Text dimColor={m.month.turns === 0}>
+                    {(m.isThis ? '* ' : '  ') + m.machine.slice(0, 16).padEnd(16)} {usd(m.month.costUsd).padStart(9)}{' '}
+                    {String(m.month.turns).padStart(5)} turns {k(m.month.output).padStart(7)} out
+                    {m.updatedAt ? `  synced ${ago(now - m.updatedAt)} ago` : '  (this machine)'}
+                  </Text>
+                ))}
+              </Box>
+            )}
             <Text> </Text>
             <Text bold>Models used (last 30 days)</Text>
             {models30.map(([m, x]) => (

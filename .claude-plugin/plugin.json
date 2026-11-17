@@ -1,1 +1,20 @@
-{ "name": "usage-stats", "version": "0.2.0", "description": "Pane, status line and /usage-stats command showing rate limits, time-to-limit, per-model tokens, cost and long-term usage history", "types": "./types/index.d.ts" }
+{
+  "name": "usage-stats",
+  "version": "0.3.0",
+  "description": "Pane, status line and /usage-stats command showing rate limits, time-to-limit, per-model tokens, cost and usage history, combinable across machines through a synced folder",
+  "types": "./types/index.d.ts",
+  "userConfig": {
+    "syncFolder": {
+      "type": "string",
+      "title": "Sync folder",
+      "description": "A folder your machines share through Dropbox, iCloud Drive, OneDrive or similar, e.g. ~/Dropbox/claude-usage. Each machine writes its own file there and the pane adds them all up. Leave empty to keep history on this machine only.",
+      "default": ""
+    },
+    "machineName": {
+      "type": "string",
+      "title": "Machine name",
+      "description": "How this machine is labelled in the per-machine breakdown. Empty uses the host name.",
+      "default": ""
+    }
+  }
+}
