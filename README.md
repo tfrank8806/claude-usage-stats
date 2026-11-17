@@ -41,7 +41,19 @@ In the desktop app, where `/plugin` does not run: click + next to the prompt box
 
 ## Combining machines
 
-Set the plugin's **Sync folder** option on each machine to a folder your machines share through Dropbox, iCloud Drive, OneDrive, Syncthing or similar, for example `~/Dropbox/claude-usage`. Optionally set **Machine name** so each one is labelled clearly (it defaults to the host name). Both can be set on the options screen shown when you install the plugin, or later in `/config`, where each is a row under the plugin. Changing them there reloads the plugin; no restart needed.
+Set the plugin's **Sync folder** option on each machine to a folder your machines share through Dropbox, iCloud Drive, OneDrive, Syncthing or similar, for example `~/Dropbox/claude-usage`. Optionally set **Machine name** so each one is labelled clearly (it defaults to the host name). Set them in Claude Code with:
+
+```
+/plugin configure usage-stats@claude-usage-stats
+```
+
+or from a shell (options you leave out keep their values):
+
+```bash
+echo '{"syncFolder":"~/Dropbox/claude-usage","machineName":"work-laptop"}' | claude plugin configure usage-stats@claude-usage-stats --values-stdin
+```
+
+Then restart Claude Code. `claude plugin configure usage-stats@claude-usage-stats` with no input shows which options are set.
 
 How it works:
 
