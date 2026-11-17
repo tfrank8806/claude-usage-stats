@@ -1,6 +1,6 @@
 {
   "name": "usage-stats",
-  "version": "0.4.0",
+  "version": "0.5.0",
   "description": "Pane, status line and /usage-stats command showing rate limits, time-to-limit, per-model tokens, cost and usage history, combinable across machines through a synced folder",
   "types": "./types/index.d.ts",
   "userConfig": {
@@ -15,6 +15,18 @@
       "title": "Machine name",
       "description": "How this machine is labelled in the per-machine breakdown. Empty uses the host name.",
       "default": ""
+    },
+    "subscriptionUsd": {
+      "type": "number",
+      "title": "Subscription price (USD/month)",
+      "description": "What your Claude plan costs per month, e.g. 20, 100 or 200. Turns on the Subscription value section: API-equivalent cost of your recorded usage against this price. 0 hides it.",
+      "default": 0
+    },
+    "billingDay": {
+      "type": "number",
+      "title": "Billing day",
+      "description": "Day of the month your plan renews (1-31; a short month renews on its last day). Sets the billing period the value is measured over.",
+      "default": 1
     }
   }
 }
