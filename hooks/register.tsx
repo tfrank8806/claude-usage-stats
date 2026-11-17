@@ -60,7 +60,8 @@ const dur = (ms: number) => {
 }
 const MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']
 const shortDate = (day: string) => `${MONTHS[Number(day.slice(5, 7)) - 1] ?? day.slice(5, 7)} ${Number(day.slice(8, 10))}`
-const SET_PRICE_HINT = 'Add your plan price to compare: /plugin configure usage-stats@claude-usage-stats'
+const CONFIGURE = '/plugin configure usage-stats@claude-usage-stats'
+const SET_PRICE_HINT = `Add your plan price to compare: ${CONFIGURE}`
 /**
  * The value section as lines, for the pane and the text summary alike: against the plan
  * when its price is set, else the API-equivalent cost alone. Lines from `dimFrom` on are notes.
@@ -721,6 +722,13 @@ async function refresh($: EngineInterface, opts: SyncOptions) {
   $.ui.status(statusText(s, (await read($, samples)) ?? {}, now))
 }
 
+// Puts the settings command in the prompt box, ready for Enter; false where there is no box.
+async function openSettings($: EngineInterface) {
+  const { isFilled } = await $.prompt.fill({ text: CONFIGURE })
+  if (isFilled) $.ui.toast('Press Enter to open the usage-stats settings')
+  return isFilled
+}
+
 export const register: Register = (on, options) => {
   const syncOpts = (force: boolean): SyncOptions => ({
     folder: typeof options.syncFolder === 'string' ? options.syncFolder : '',
@@ -734,7 +742,7 @@ export const register: Register = (on, options) => {
   on('session.start', async ($, e, next) => {
     await $.command.register({
       name: 'usage-stats',
-      description: 'Open the Claude usage stats pane (add "history" or "value" for a text summary)',
+      description: 'Open the Claude usage stats pane ("history" or "value" for a text summary, "settings" to configure)',
     })
     const now = await $.clock.now()
     const u = await $.session.usage()
@@ -763,6 +771,9 @@ export const register: Register = (on, options) => {
     await recordLimits($, s.limits, now, s.costUsd ?? 0)
     await loadHistory($, now, syncOpts(true))
     await $.ui.open({ id: PANE, title: 'Claude usage' })
+    if (e.args.trim() === 'settings') {
+      return { text: (await openSettings($)) ? 'Press Enter to open the settings.' : `Run ${CONFIGURE} to open the settings.` }
+    }
     if (e.args.trim() === 'value') {
       const v = (await read($, history))?.value
       if (!v) return { text: 'No usage recorded yet; it starts with your next reply.' }
@@ -844,7 +855,7 @@ export const register: Register = (on, options) => {
   })
 
   on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {
-    const { Box, Text } = $.ui.resolve(e)
+    const { Box, Text, Button } = $.ui.resolve(e)
     const s = await read($, snapshot)
     const t = (await read($, tokens)) ?? ZERO
     const hist = (await read($, samples)) ?? {}
@@ -1007,6 +1018,13 @@ export const register: Register = (on, options) => {
             ))}
           </Box>
         )}
+        <Text> </Text>
+        <Box flexDirection="row">
+          <Text dimColor>Settings: {CONFIGURE} </Text>
+          {(e.surface === 'terminal' || e.surface === 'desktop') && (
+            <Button key="settings" label="Open settings" onPress={() => openSettings($)} />
+          )}
+        </Box>
       </Box>
     )
   })

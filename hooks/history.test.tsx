@@ -594,3 +594,39 @@ test('other apps: an idle spell is not mistaken for Claude Code at the next repl
   expect(text).toContain('Other apps (estimated) $9.00')
   expect(text).toContain('~$1.00 per point')
 })
+
+test('settings: the pane shows the command everywhere and a button where it can fill the prompt', async ($, on) => {
+  const fills: string[] = []
+  const toasts: string[] = []
+  on('prompt.fill', (_, e) => (fills.push(e.text), { isFilled: true }))
+  on('ui.toast', (_, e) => (toasts.push(String(e.text)), { value: undefined }))
+  await valueText($, on, STORE)
+  for (const surface of ['terminal', 'desktop', 'vscode', 'mobile'] as const) {
+    const ui = await $.ui.mount({
+      plugin: 'usage-stats',
+      component: 'Pane',
+      requestId: 'usage-stats',
+      surface,
+      props: { title: 'Claude usage', isFocused: false, bodyColumns: 100, placement: 'dock', scroll: { offset: 0, bodyRows: 90 }, view: {} },
+    })
+    expect((await ui.find({ type: 'Text', text: /^Settings: / }))?.text).toContain('/plugin configure usage-stats@claude-usage-stats')
+    if (surface === 'terminal' || surface === 'desktop') {
+      await ui.press({ key: 'settings' })
+      expect(fills.at(-1)).toBe('/plugin configure usage-stats@claude-usage-stats')
+    }
+    await ui.unmount()
+  }
+  expect(fills.length).toBe(2)
+  expect(toasts).toContain('Press Enter to open the usage-stats settings')
+})
+
+test('settings: /usage-stats settings fills the prompt, or names the command where it cannot', async ($, on) => {
+  let isFilled = true
+  on('prompt.fill', () => ({ isFilled }))
+  on('ui.toast', () => ({ value: undefined }))
+  await valueText($, on, STORE)
+  const run = async () => ((await $.command.run({ ...HISTORY, args: 'settings' })) as { text: string }).text
+  expect(await run()).toBe('Press Enter to open the settings.')
+  isFilled = false
+  expect(await run()).toBe('Run /plugin configure usage-stats@claude-usage-stats to open the settings.')
+})
