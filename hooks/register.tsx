@@ -24,6 +24,12 @@ const KEEP_DAYS = 180 // history older than this is pruned from the store
 const CHART_DAYS = 14
 const DAY_PREFIX = 'day:'
 const SYNC_EVERY_MS = 2 * 60 * 1000 // write and read the sync folder at most this often, but always at start and end
+const REFRESH_MS = 60 * 1000 // while a session is open, refresh the figures this often, even with no turns
+const HEARTBEAT_MS = 30 * 60 * 1000 // an idle machine still rewrites its file this often, so others see it is alive
+
+// What this machine last wrote to the sync folder, so an idle refresh skips an unchanged
+// write. Module state: a reload starts it over, which costs one extra write.
+let lastWrite: { body: string; at: number } | undefined
 
 const snapshot = atom({ plugin: 'usage-stats', key: 'snapshot' } as const, null, { shape: 'snap-2' })
 const tokens = atom({ plugin: 'usage-stats', key: 'tokens' } as const, ZERO, { shape: 'tok-2' })
@@ -267,20 +273,20 @@ async function syncFolder(
   const isDue = opts.force || !prev || prev.folder !== where.dir || now - (prev.lastAt ?? 0) >= SYNC_EVERY_MS
   if (!isDue) return
   const id = await machineIdOf($)
-  const file: MachineFile = {
-    version: 1,
-    machineId: id,
-    machine: await machineNameOf($, opts.machineName, id),
-    updatedAt: now,
-    entries: own,
-  }
+  const machine = await machineNameOf($, opts.machineName, id)
+  const file: MachineFile = { version: 1, machineId: id, machine, updatedAt: now, entries: own }
+  const ownPath = `${where.dir}${where.sep}usage-${id}.json`
+  const body = `${ownPath}\n${machine}\n${JSON.stringify(own)}`
+  const isUnchanged = !opts.force && lastWrite?.body === body && now - lastWrite.at < HEARTBEAT_MS
   try {
-    const ownPath = `${where.dir}${where.sep}usage-${id}.json`
-    await $.fs.write(ownPath, JSON.stringify(file))
-    // The file is written owner-only (0600), which on a shared folder also zeroes the
-    // ACL mask, so the other machines' users (e.g. through Samba) cannot read it.
-    // Let the group read it: that lifts the mask to r-- and leaves "other" untouched.
-    if (where.sep === '/') await $.process.run(['chmod', 'g+r', ownPath]).catch(() => undefined)
+    if (!isUnchanged) {
+      await $.fs.write(ownPath, JSON.stringify(file))
+      lastWrite = { body, at: now }
+      // The file is written owner-only (0600), which on a shared folder also zeroes the
+      // ACL mask, so the other machines' users (e.g. through Samba) cannot read it.
+      // Let the group read it: that lifts the mask to r-- and leaves "other" untouched.
+      if (where.sep === '/') await $.process.run(['chmod', 'g+r', ownPath]).catch(() => undefined)
+    }
     const found: Record<string, MachineFile> = {}
     const problems: string[] = []
     for (const f of await $.fs.list(where.dir)) {
@@ -416,6 +422,18 @@ async function loadHistory($: EngineInterface, now: number, opts: SyncOptions) {
   await update($, history, () => hx)
 }
 
+// The periodic refresh: the session's figures, the limit countdowns, and the sync folder,
+// so the pane and status line keep up with other machines while this one sits idle.
+async function refresh($: EngineInterface, opts: SyncOptions) {
+  const now = await $.clock.now()
+  const prev = await read($, snapshot)
+  const s = toSnapshot(await $.session.usage(), prev?.startedAt ?? now)
+  await update($, snapshot, () => s)
+  await recordSamples($, s.limits, now)
+  await loadHistory($, now, opts)
+  $.ui.status(statusText(s, (await read($, samples)) ?? {}, now))
+}
+
 export const register: Register = (on, options) => {
   const syncOpts = (force: boolean): SyncOptions => ({
     folder: typeof options.syncFolder === 'string' ? options.syncFolder : '',
@@ -437,6 +455,12 @@ export const register: Register = (on, options) => {
     await recordSamples($, s.limits, now)
     await loadHistory($, now, syncOpts(true))
     $.ui.status(statusText(s, (await read($, samples)) ?? {}, now))
+    // Keep refreshing while the session is open; a reload drops this timer and starts a new one.
+    if (e.isInteractive) {
+      $.clock.every(REFRESH_MS, () => {
+        void refresh($, syncOpts(false)).catch(() => undefined)
+      })
+    }
     return next(e)
   })
 

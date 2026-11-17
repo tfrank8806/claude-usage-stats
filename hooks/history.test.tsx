@@ -206,7 +206,8 @@ test(
       await ui.unmount()
     }
 
-    // Turns within two minutes don't rewrite the file; one after does, and so does the end.
+    // A turn within two minutes doesn't rewrite the file; the refresh at the two-minute mark
+    // writes what changed, a later turn inside that window waits, and the end always writes.
     const before = writes.length
     await $.turn.complete({ answer: '', durationMs: 1, isAborted: false, turnId: 't', reason: 'answer' })
     expect(writes.length).toBe(before)
@@ -269,3 +270,84 @@ test(
     expect(runs).toEqual([])
   },
 )
+
+test(
+  'while idle the pane picks up another machine, and an unchanged file is not rewritten until the heartbeat',
+  { options: { syncFolder: '/sync', machineName: 'laptop' } },
+  async ($, on) => {
+    const clock = mock.clock(on, { now: NOON })
+    mock.store(on, {
+      'day:2026-11-16:mine': {
+        day: '2026-11-16', turns: 1, input: 1, output: 100, cacheRead: 0, cacheWrite: 0, costUsd: 1, byModel: {}, peaks: {},
+      },
+    })
+    const files: Record<string, string> = {}
+    const writes: number[] = []
+    on('fs.write', (_, e) => {
+      files[e.path] = e.text
+      writes.push(clock.now())
+      return { value: undefined }
+    })
+    on('fs.list', () => ({
+      value: Object.keys(files).map(p => ({ name: p.slice('/sync/'.length), kind: 'file' as const, size: 1, mtimeMs: 0, isLink: false })),
+    }))
+    on('fs.read', (_, e) => ({ value: files[e.path] ?? '' }))
+    on('process.run', () => ({ value: { exitCode: 0, stdout: '', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }))
+    on('env.get', () => ({ value: undefined }))
+    on('session.usage', () => ({ value: { startedAt: NOON, context: { window: 200000 }, rateLimits: [], cost: { usd: 0 } } }))
+    on('session.id', () => ({ value: 'me' }))
+    on('command.register', () => ({ value: { command: 'usage-stats' } }))
+    on('ui.status', () => ({ value: undefined }))
+    on('session.start', (_, e) => ({ cwd: e.cwd }))
+
+    await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+    expect(writes).toEqual([NOON])
+
+    // Another machine's file lands while this one is idle: no turn, no command.
+    files['/sync/usage-desk0001.json'] = JSON.stringify({
+      version: 1, machineId: 'desk0001', machine: 'desktop', updatedAt: NOON,
+      entries: { 'day:2026-11-16:s-desk': { day: '2026-11-16', turns: 2, input: 1, output: 1, cacheRead: 0, cacheWrite: 0, costUsd: 2, byModel: {}, peaks: {} } },
+    })
+    await clock.advance(2 * 60 * 1000)
+
+    const ui = await $.ui.mount({
+      plugin: 'usage-stats',
+      component: 'Pane',
+      requestId: 'usage-stats',
+      surface: 'desktop',
+      props: { title: 'Claude usage', isFocused: false, bodyColumns: 100, placement: 'dock', scroll: { offset: 0, bodyRows: 80 }, view: {} },
+    })
+    expect((await ui.find({ type: 'Text', text: /^History/ }))?.text).toContain('2 machines')
+    expect((await ui.find({ type: 'Text', text: /^Today/ }))?.text).toContain('$3.00')
+    await ui.unmount()
+
+    // Nothing changed here, so idle refreshes don't rewrite this machine's file...
+    await clock.advance(20 * 60 * 1000)
+    expect(writes).toEqual([NOON])
+    // ...until the half-hourly heartbeat.
+    await clock.advance(12 * 60 * 1000)
+    expect(writes.length).toBe(2)
+    expect(writes[1]! - NOON).toBeGreaterThanOrEqual(30 * 60 * 1000)
+    expect(writes[1]! - NOON).toBeLessThanOrEqual(33 * 60 * 1000)
+  },
+)
+
+test('a non-interactive session starts no refresh timer', { options: { syncFolder: '/sync' } }, async ($, on) => {
+  const clock = mock.clock(on, { now: NOON })
+  mock.store(on, {})
+  let usageCalls = 0
+  on('fs.write', () => ({ value: undefined }))
+  on('fs.list', () => ({ value: [] }))
+  on('process.run', () => ({ value: { exitCode: 0, stdout: '', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }))
+  on('env.get', () => ({ value: undefined }))
+  on('session.usage', () => (usageCalls++, { value: { startedAt: NOON, context: { window: 200000 }, rateLimits: [], cost: { usd: 0 } } }))
+  on('session.id', () => ({ value: 'me' }))
+  on('command.register', () => ({ value: { command: 'usage-stats' } }))
+  on('ui.status', () => ({ value: undefined }))
+  on('session.start', (_, e) => ({ cwd: e.cwd }))
+
+  await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: false })
+  const after = usageCalls
+  await clock.advance(10 * 60 * 1000)
+  expect(usageCalls).toBe(after)
+})
