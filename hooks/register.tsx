@@ -12,6 +12,7 @@ import type {
   ModelTally,
   Sample,
   Snapshot,
+  SubscriptionValue,
   Tokens,
   Totals,
 } from '../types'
@@ -52,6 +53,25 @@ const dur = (ms: number) => {
   const hrs = Math.floor(ms / 3.6e6)
   const m = Math.floor((ms % 3.6e6) / 6e4)
   return hrs >= 24 ? `${Math.floor(hrs / 24)}d ${hrs % 24}h` : hrs > 0 ? `${hrs}h ${m}m` : `${m}m`
+}
+const MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']
+const shortDate = (day: string) => `${MONTHS[Number(day.slice(5, 7)) - 1] ?? day.slice(5, 7)} ${Number(day.slice(8, 10))}`
+/** The value section as lines, for the pane and the text summary alike. */
+const valueLines = (v: SubscriptionValue): { head: string; lines: string[]; multiple: number } => {
+  const multiple = v.spendUsd / v.priceUsd
+  const lines = [
+    `Plan ${usd(v.priceUsd)}/mo · ${shortDate(v.periodStart)} – ${shortDate(v.periodEnd)} (day ${v.daysElapsed} of ${v.periodDays})`,
+    `API-equivalent so far  ${usd(v.spendUsd)}  = ${multiple.toFixed(2)}× the plan`,
+    `Projected this period  ${usd(v.projectedUsd)}  = ${(v.projectedUsd / v.priceUsd).toFixed(2)}×`,
+    v.breakEven
+      ? v.breakEven.isProjected
+        ? `Break-even            ~${shortDate(v.breakEven.day)} at this pace`
+        : `Break-even            reached ${shortDate(v.breakEven.day)}`
+      : `Break-even            not this period at this pace (API would cost less)`,
+  ]
+  if (v.trackedFrom) lines.push(`Recorded since ${shortDate(v.trackedFrom)} only; earlier days of this period aren't counted.`)
+  lines.push('Claude Code only: claude.ai, desktop and mobile chats are not included.')
+  return { head: 'Subscription value', lines, multiple }
 }
 const ago = (ms: number) => (ms < 6e4 ? '<1m' : dur(ms))
 const two = (n: number) => String(n).padStart(2, '0')
@@ -203,7 +223,64 @@ async function recordTurn($: EngineInterface, u: RawUsage & { model: string }, n
   await $.store.set(key, entry)
 }
 
-type SyncOptions = { folder: string; machineName: string; force: boolean }
+type SyncOptions = { folder: string; machineName: string; force: boolean; priceUsd: number; billingDay: number }
+
+/** A local `YYYY-MM-DD` as a local-midnight Date. */
+const dateOfDay = (day: string) => {
+  const [y, m, d] = day.split('-').map(Number)
+  return new Date(y ?? 1970, (m ?? 1) - 1, d ?? 1)
+}
+const daysBetween = (a: string, b: string) => Math.round((dateOfDay(b).getTime() - dateOfDay(a).getTime()) / 864e5)
+const addDays = (day: string, n: number) => {
+  const d = dateOfDay(day)
+  return dayOf(new Date(d.getFullYear(), d.getMonth(), d.getDate() + n).getTime())
+}
+/** The renewal day in a month, clamped to the month's length (the 31st renews on the 30th in November). */
+const renewalIn = (year: number, month: number, billingDay: number) =>
+  new Date(year, month, Math.min(billingDay, new Date(year, month + 1, 0).getDate()))
+
+/** The billing period holding `today`: from the last renewal through the day before the next. */
+const billingPeriod = (today: string, billingDay: number) => {
+  const t = dateOfDay(today)
+  const thisMonth = renewalIn(t.getFullYear(), t.getMonth(), billingDay)
+  const start = t >= thisMonth ? thisMonth : renewalIn(t.getFullYear(), t.getMonth() - 1, billingDay)
+  const next = renewalIn(start.getFullYear(), start.getMonth() + 1, billingDay)
+  const startDay = dayOf(start.getTime())
+  const endDay = addDays(dayOf(next.getTime()), -1)
+  return { startDay, endDay, periodDays: daysBetween(startDay, endDay) + 1 }
+}
+
+/** Subscription value this period from per-day API-equivalent cost. */
+const subscriptionValue = (
+  costByDay: Record<string, number>,
+  today: string,
+  firstDay: string | undefined,
+  priceUsd: number,
+  billingDay: number,
+): SubscriptionValue => {
+  const { startDay, endDay, periodDays } = billingPeriod(today, billingDay)
+  const daysElapsed = daysBetween(startDay, today) + 1
+  const days = Object.keys(costByDay).filter(d => d >= startDay && d <= today).sort()
+  let spendUsd = 0
+  let reachedOn: string | undefined
+  for (const d of days) {
+    spendUsd += costByDay[d] ?? 0
+    if (!reachedOn && spendUsd >= priceUsd) reachedOn = d
+  }
+  // Pace over the days actually recorded this period, so a late install doesn't dilute it.
+  const trackedFrom = firstDay && firstDay > startDay ? firstDay : undefined
+  const paceDays = trackedFrom ? daysBetween(trackedFrom, today) + 1 : daysElapsed
+  const perDay = paceDays > 0 ? spendUsd / paceDays : 0
+  const projectedUsd = spendUsd + perDay * (periodDays - daysElapsed)
+  let breakEven: SubscriptionValue['breakEven']
+  if (reachedOn) breakEven = { day: reachedOn, isProjected: false }
+  else if (perDay > 0) {
+    const day = addDays(today, Math.ceil((priceUsd - spendUsd) / perDay))
+    if (day <= endDay) breakEven = { day, isProjected: true }
+  }
+  return { priceUsd, periodStart: startDay, periodEnd: endDay, periodDays, daysElapsed, spendUsd, projectedUsd, trackedFrom, breakEven }
+}
+
 
 const isRecord = (v: unknown): v is Record<string, unknown> => !!v && typeof v === 'object' && !Array.isArray(v)
 
@@ -365,8 +442,10 @@ async function loadHistory($: EngineInterface, now: number, opts: SyncOptions) {
     activeDays: 0,
   })
 
+  const costByDay: Record<string, number> = {}
   for (const { entry, machineId } of all.values()) {
     if (!firstDay || entry.day < firstDay) firstDay = entry.day
+    costByDay[entry.day] = (costByDay[entry.day] ?? 0) + entry.costUsd
     const inSpan = {
       today: entry.day === today,
       week: entry.day >= weekFrom,
@@ -418,7 +497,8 @@ async function loadHistory($: EngineInterface, now: number, opts: SyncOptions) {
       }))
       .sort((a, b) => b.month.costUsd - a.month.costUsd),
   ]
-  const hx: History = { ...spans, firstDay, recent, models30, machines, sync: status }
+  const value = opts.priceUsd > 0 ? subscriptionValue(costByDay, today, firstDay, opts.priceUsd, opts.billingDay) : undefined
+  const hx: History = { ...spans, firstDay, recent, models30, machines, sync: status, value }
   await update($, history, () => hx)
 }
 
@@ -439,12 +519,14 @@ export const register: Register = (on, options) => {
     folder: typeof options.syncFolder === 'string' ? options.syncFolder : '',
     machineName: typeof options.machineName === 'string' ? options.machineName : '',
     force,
+    priceUsd: Math.max(0, Number(options.subscriptionUsd) || 0),
+    billingDay: Math.min(31, Math.max(1, Math.round(Number(options.billingDay) || 1))),
   })
 
   on('session.start', async ($, e, next) => {
     await $.command.register({
       name: 'usage-stats',
-      description: 'Open the Claude usage stats pane (add "history" for a text summary of past usage)',
+      description: 'Open the Claude usage stats pane (add "history" or "value" for a text summary)',
     })
     const now = await $.clock.now()
     const u = await $.session.usage()
@@ -471,6 +553,12 @@ export const register: Register = (on, options) => {
     await recordSamples($, s.limits, now)
     await loadHistory($, now, syncOpts(true))
     await $.ui.open({ id: PANE, title: 'Claude usage' })
+    if (e.args.trim() === 'value') {
+      const v = (await read($, history))?.value
+      if (!v) return { text: 'Set your plan price first: the subscriptionUsd option (and billingDay, the day it renews).' }
+      const { head, lines } = valueLines(v)
+      return { text: [head, ...lines].join('\n') }
+    }
     if (e.args.trim() === 'history') {
       const hx = await read($, history)
       if (!hx || hx.all.turns === 0) return { text: 'No usage history recorded yet; it starts with your next reply.' }
@@ -493,6 +581,7 @@ export const register: Register = (on, options) => {
                 ...(hx.sync.error ? [`Sync problem: ${hx.sync.error}`] : []),
               ]
             : ['', 'This machine only. Set the syncFolder option to combine machines.']),
+          ...(hx.value ? ['', valueLines(hx.value).head, ...valueLines(hx.value).lines] : []),
         ].join('\n'),
       }
     }
@@ -630,6 +719,24 @@ export const register: Register = (on, options) => {
         <Text>Input     {k(t.input)}  (cache read {k(t.cacheRead)}, write {k(t.cacheWrite)})</Text>
         <Text>Output    {k(t.output)}</Text>
         <Text> </Text>
+        {hx?.value && (
+          <Box flexDirection="column">
+            <Text bold>Subscription value</Text>
+            {valueLines(hx.value).lines.map((line, i) => (
+              <Text
+                color={i === 1 ? (hx.value!.spendUsd >= hx.value!.priceUsd ? 'green' : undefined) : undefined}
+                dimColor={i >= 4}
+              >
+                {line}
+              </Text>
+            ))}
+            <Text>
+              {bar(Math.min(100, (hx.value.spendUsd / hx.value.priceUsd) * 100))}{' '}
+              {Math.round((hx.value.spendUsd / hx.value.priceUsd) * 100)}% of break-even
+            </Text>
+            <Text> </Text>
+          </Box>
+        )}
         <Text bold>
           History
           {hx?.firstDay

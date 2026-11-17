@@ -65,6 +65,29 @@ export type History = {
   models30: Record<string, ModelTally>
   machines: MachineRow[]
   sync?: SyncStatus
+  /** Subscription value for the current billing period; absent until a plan price is set. */
+  value?: SubscriptionValue
+}
+/**
+ * What the subscription is worth this billing period: the API-equivalent cost of the
+ * recorded usage set against the plan's price. Days are local `YYYY-MM-DD`.
+ */
+export type SubscriptionValue = {
+  priceUsd: number
+  periodStart: string
+  /** The last day of the period, inclusive. */
+  periodEnd: string
+  periodDays: number
+  /** Days of the period up to and including today. */
+  daysElapsed: number
+  /** API-equivalent cost recorded so far this period, all synced machines. */
+  spendUsd: number
+  /** spendUsd at this period's pace so far, carried to the period's end. */
+  projectedUsd: number
+  /** The first day history covers when that is after the period started; earlier days are unrecorded. */
+  trackedFrom?: string
+  /** The day spend reached the price, or at this pace will; absent when it won't this period. */
+  breakEven?: { day: string; isProjected: boolean }
 }
 /** What this session has already written to history, so each turn adds only what is new. */
 export type Ledger = { lastCostUsd: number }

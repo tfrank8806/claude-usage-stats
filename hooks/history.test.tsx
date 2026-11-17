@@ -1,4 +1,5 @@
 import { expect, mock, test } from 'claude-code/testing'
+import type { TestBody } from 'claude-code/testing'
 
 const NOON = new Date(2026, 10, 16, 12, 0, 0).getTime() // 16 Nov 2026, local noon
 const DAY = 864e5
@@ -350,4 +351,88 @@ test('a non-interactive session starts no refresh timer', { options: { syncFolde
   const after = usageCalls
   await clock.advance(10 * 60 * 1000)
   expect(usageCalls).toBe(after)
+})
+
+const day = (d: string, costUsd: number) => ({
+  day: d, turns: 1, input: 1, output: 1, cacheRead: 0, cacheWrite: 0, costUsd, byModel: {}, peaks: {},
+})
+const valueText = async (
+  $: Parameters<TestBody>[0],
+  on: Parameters<TestBody>[1],
+  store: Record<string, unknown>,
+) => {
+  mock.clock(on, { now: NOON })
+  mock.store(on, store)
+  on('session.usage', () => ({ value: { startedAt: NOON, context: { window: 200000 }, rateLimits: [], cost: { usd: 0 } } }))
+  on('session.id', () => ({ value: 'me' }))
+  on('command.register', () => ({ value: { command: 'usage-stats' } }))
+  on('ui.open', () => ({ value: { isPlaced: true } }))
+  on('ui.status', () => ({ value: undefined }))
+  on('session.start', (_, e) => ({ cwd: e.cwd }))
+  await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: false })
+  const r = await $.command.run({ ...HISTORY, args: 'value' })
+  return (r as { text: string }).text
+}
+const STORE = {
+  'day:2026-11-01:a': day('2026-11-01', 999), // before the period: not counted
+  'day:2026-11-06:b': day('2026-11-06', 50),
+  'day:2026-11-10:c': day('2026-11-10', 60), // cumulative $110 passes $100 here
+  'day:2026-11-16:d': day('2026-11-16', 20),
+}
+
+test('value: spend, multiple, projection and break-even reached', { options: { subscriptionUsd: 100, billingDay: 5 } }, async ($, on) => {
+  const text = await valueText($, on, STORE)
+  expect(text).toContain('Plan $100.00/mo · Nov 5 – Dec 4 (day 12 of 30)')
+  expect(text).toContain('API-equivalent so far  $130.00  = 1.30× the plan')
+  // $130 over 12 days, carried to 30: 130 + 130/12 × 18 = 325.
+  expect(text).toContain('Projected this period  $325.00  = 3.25×')
+  expect(text).toContain('Break-even            reached Nov 10')
+  expect(text).not.toContain('Recorded since')
+})
+
+test('value: projected break-even, and none when the pace falls short', { options: { subscriptionUsd: 200, billingDay: 5 } }, async ($, on) => {
+  const text = await valueText($, on, STORE)
+  // $70 to go at $130/12 a day: ceil(6.46) = 7 days after Nov 16.
+  expect(text).toContain('Break-even            ~Nov 23 at this pace')
+})
+
+test('value: a price the pace never reaches', { options: { subscriptionUsd: 1000, billingDay: 5 } }, async ($, on) => {
+  const text = await valueText($, on, STORE)
+  expect(text).toContain('not this period at this pace')
+})
+
+test('value: a late install paces on recorded days only and says so', { options: { subscriptionUsd: 100, billingDay: 5 } }, async ($, on) => {
+  const { 'day:2026-11-01:a': _, ...late } = STORE
+  const text = await valueText($, on, late)
+  // Recorded Nov 6–16 (11 days): 130 + 130/11 × 18 = 342.73.
+  expect(text).toContain('Projected this period  $342.73')
+  expect(text).toContain("Recorded since Nov 6 only; earlier days of this period aren't counted.")
+})
+
+test('value: a billing day past the month end renews on its last day', { options: { subscriptionUsd: 100, billingDay: 31 } }, async ($, on) => {
+  const text = await valueText($, on, STORE)
+  // November has 30 days, so the period runs Oct 31 – Nov 29.
+  expect(text).toContain('Oct 31 – Nov 29 (day 17 of 30)')
+})
+
+test('value: hidden until a price is set', async ($, on) => {
+  const text = await valueText($, on, STORE)
+  expect(text).toContain('Set your plan price first')
+})
+
+test('value: the pane draws the section on every surface', { options: { subscriptionUsd: 100, billingDay: 5 } }, async ($, on) => {
+  await valueText($, on, STORE)
+  for (const surface of ['terminal', 'desktop', 'vscode', 'mobile'] as const) {
+    const ui = await $.ui.mount({
+      plugin: 'usage-stats',
+      component: 'Pane',
+      requestId: 'usage-stats',
+      surface,
+      props: { title: 'Claude usage', isFocused: false, bodyColumns: 100, placement: 'dock', scroll: { offset: 0, bodyRows: 90 }, view: {} },
+    })
+    expect((await ui.find({ type: 'Text', text: /^Subscription value/ }))?.text).toBe('Subscription value')
+    expect((await ui.find({ type: 'Text', text: /^API-equivalent so far/ }))?.text).toContain('1.30×')
+    expect((await ui.find({ type: 'Text', text: /of break-even$/ }))?.text).toContain('130% of break-even')
+    await ui.unmount()
+  }
 })
