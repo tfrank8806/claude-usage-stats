@@ -112,7 +112,7 @@ Without it, update by hand: `claude plugin marketplace update claude-usage-stats
 
 ## Use
 
-Run `/usage-stats` to open the pane. Its last line shows the settings command, with an **Open settings** button (terminal and desktop) that puts `/plugin configure usage-stats@claude-usage-stats` in the prompt box; press Enter. `/usage-stats settings` does the same. The status line entry updates after each turn.
+Run `/usage-stats` to open the pane. A **View** picker at the top switches between **Now** (plan limits, context, this session), **Cost** or **Value** (API-equivalent cost, against your plan once its price is set), **History** (totals, the 14-day chart, models) and **Machines** (with a sync folder). Bars turn yellow from 70% and red from 90%. Its last line shows the settings command, with an **Open settings** button (terminal and desktop) that puts `/plugin configure usage-stats@claude-usage-stats` in the prompt box; press Enter. `/usage-stats settings` does the same. The status line entry updates after each turn.
 
 ## License
 

@@ -43,16 +43,13 @@ const history = atom({ plugin: 'usage-stats', key: 'history' } as const, null, {
 const ledger = atom({ plugin: 'usage-stats', key: 'ledger' } as const, null, { shape: 'ledger-1' })
 const remote = atom({ plugin: 'usage-stats', key: 'remote' } as const, {}, { shape: 'remote-1' })
 const sync = atom({ plugin: 'usage-stats', key: 'sync' } as const, null, { shape: 'sync-1' })
+const tab = atom({ plugin: 'usage-stats', key: 'tab' } as const, 'now', { shape: 'tab-1' })
 
 const LABEL: Record<string, string> = { five_hour: '5-hour', seven_day: 'Weekly', spend_limit: 'Spend' }
 const label = (kind: string) => LABEL[kind] ?? kind
 const k = (n: number) => (n >= 1e6 ? `${(n / 1e6).toFixed(2)}M` : n >= 1e3 ? `${(n / 1e3).toFixed(1)}k` : `${n}`)
 const usd = (n: number) => `$${n.toFixed(2)}`
 const pct = (part: number, whole: number) => (whole > 0 ? Math.round((part / whole) * 100) : 0)
-const bar = (p: number, w = 20) => {
-  const f = Math.max(0, Math.min(w, Math.round((p / 100) * w)))
-  return '█'.repeat(f) + '░'.repeat(w - f)
-}
 const dur = (ms: number) => {
   const hrs = Math.floor(ms / 3.6e6)
   const m = Math.floor((ms % 3.6e6) / 6e4)
@@ -784,7 +781,7 @@ export const register: Register = (on, options) => {
       const hx = await read($, history)
       if (!hx || hx.all.turns === 0) return { text: 'No usage history recorded yet; it starts with your next reply.' }
       const line = (name: string, t: Totals) =>
-        `${name.padEnd(13)} ${usd(t.costUsd).padStart(9)}  ${String(t.turns).padStart(5)} turns  ${k(t.output).padStart(7)} out  ${t.sessions} sessions`
+        `${name.padEnd(Math.max(13, name.length))} ${usd(t.costUsd).padStart(9)}  ${String(t.turns).padStart(5)} turns  ${k(t.output).padStart(7)} out  ${t.sessions} sessions`
       return {
         text: [
           `Usage history (since ${hx.firstDay ?? 'today'}${hx.sync ? `, ${hx.machines.length} machine${hx.machines.length === 1 ? '' : 's'}` : ', this machine'})`,
@@ -797,7 +794,7 @@ export const register: Register = (on, options) => {
                 '',
                 `By machine, last 30 days (sync: ${hx.sync.folder})`,
                 ...hx.machines.map(m =>
-                  line(`${m.isThis ? '* ' : '  '}${m.machine}`.slice(0, 13), m.month) + (m.updatedAt ? `  (synced ${ago(now - m.updatedAt)} ago)` : ''),
+                  line(`${m.isThis ? '* ' : '  '}${m.machine}`, m.month) + (m.updatedAt ? `  (synced ${ago(now - m.updatedAt)} ago)` : ''),
                 ),
                 ...(hx.sync.error ? [`Sync problem: ${hx.sync.error}`] : []),
               ]
@@ -855,172 +852,206 @@ export const register: Register = (on, options) => {
   })
 
   on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {
-    const { Box, Text, Button } = $.ui.resolve(e)
+    const { Box, Text, Button, Select } = $.ui.resolve(e)
     const s = await read($, snapshot)
     const t = (await read($, tokens)) ?? ZERO
     const hist = (await read($, samples)) ?? {}
     const hx = await read($, history)
+    const chosen = await read($, tab)
     const now = await $.clock.now()
-    const models = Object.entries(t.byModel).sort((a, b) => b[1].output - a[1].output)
     const totalAll = (m: ModelTally) => m.input + m.output + m.cacheRead + m.cacheWrite
-    const grand = totalAll(t)
-    const elapsedHr = s ? (now - s.startedAt) / 3.6e6 : 0
-    const models30 = Object.entries(hx?.models30 ?? {}).sort((a, b) => b[1].output - a[1].output)
-    const grand30 = models30.reduce((n, [, m]) => n + totalAll(m), 0)
-    const maxDayCost = Math.max(0, ...(hx?.recent ?? []).map(r => r.costUsd))
-    const maxDayOut = Math.max(0, ...(hx?.recent ?? []).map(r => r.output))
-    const chartByCost = maxDayCost > 0
-    const span = (name: string, x: Totals) => (
-      <Text>
-        {name.padEnd(13)} {usd(x.costUsd).padStart(9)} {String(x.turns).padStart(5)} turns {k(x.output).padStart(7)} out{' '}
-        {String(x.sessions).padStart(3)} sess
+
+    const tabs = [
+      { value: 'now', label: 'Now', key: 'now' },
+      { value: 'value', label: hx?.value && hx.value.priceUsd > 0 ? 'Value' : 'Cost', key: 'value' },
+      { value: 'history', label: 'History', key: 'history' },
+      ...(hx?.sync ? [{ value: 'machines', label: 'Machines', key: 'machines' }] : []),
+    ]
+    const current = tabs.some(x => x.value === chosen) ? (chosen as string) : 'now'
+
+    // Building blocks: a heading, a label/value row that lines up in any font, a note.
+    const heading = (text: string) => (
+      <Box marginTop={1}>
+        <Text weight="semibold" bold>
+          {text}
+        </Text>
+      </Box>
+    )
+    const row = (name: string, value: string, color?: 'green' | 'yellow' | 'red') => (
+      <Box flexDirection="row" justifyContent="space-between" columnGap={2}>
+        <Text dimColor wrap="truncate-end">
+          {name}
+        </Text>
+        <Text tabular color={color}>
+          {value}
+        </Text>
+      </Box>
+    )
+    const note = (text: string, color?: 'red') => (
+      <Text dimColor={!color} color={color} size="footnote" wrap="wrap">
+        {text}
       </Text>
     )
+    const level = (pct: number) => (pct >= 90 ? 'red' : pct >= 70 ? 'yellow' : 'green')
+    // A level, not a task, so a bar of Boxes rather than Progress: label and figure, the bar below.
+    const meter = (name: string, value: number, max: number, figure: string, color: string = 'blue') => {
+      const fill = max > 0 ? Math.max(0, Math.min(100, (value / max) * 100)) : 0
+      return (
+        <Box flexDirection="column">
+          {row(name, figure)}
+          <Box flexDirection="row" width="100%" height={1} backgroundColor="gray">
+            {fill > 0 && <Box width={`${Math.max(1, Math.round(fill))}%`} height={1} backgroundColor={color} />}
+          </Box>
+        </Box>
+      )
+    }
+    const share = (name: string, part: number, whole: number, detail: string) =>
+      meter(name, whole > 0 ? part : 0, whole, `${pct(part, whole)}% · ${detail}`)
+
+    // --- Now: limits, context, this session ---
+    const nowTab = () => {
+      const models = Object.entries(t.byModel).sort((a, b) => b[1].output - a[1].output)
+      const grand = totalAll(t)
+      const elapsedHr = s ? (now - s.startedAt) / 3.6e6 : 0
+      return (
+        <Box flexDirection="column">
+          {heading('Plan limits')}
+          {(!s || s.limits.length === 0) &&
+            note("No readings: this session isn't reporting plan limits (they come with a Claude subscription).")}
+          {s?.limits.map(l => {
+            const eta = projectEta(l, hist[l.kind], now)
+            const reset = l.resetsAt ? Date.parse(l.resetsAt) - now : NaN
+            const resetText = Number.isFinite(reset) ? (reset > 0 ? `resets in ${dur(reset)}` : 'resetting') : ''
+            return (
+              <Box flexDirection="column" marginTop={1}>
+                {meter(label(l.kind), l.percentUsed, 100, `${l.percentUsed}%${resetText ? ` · ${resetText}` : ''}`, level(l.percentUsed))}
+                {eta.kind === 'hit' &&
+                  note(
+                    eta.inMs === 0
+                      ? 'Limit reached'
+                      : `At ${eta.ratePerHr.toFixed(1)}%/h, full ~${clock(eta.at)} (in ${dur(eta.inMs)})` +
+                          (eta.beforeResetBy ? `, ${dur(eta.beforeResetBy)} before reset` : ''),
+                    'red',
+                  )}
+                {eta.kind === 'safe' && note(`At ${eta.ratePerHr.toFixed(1)}%/h, won't fill before reset`)}
+                {eta.kind === 'none' && note(`Time to limit: ${eta.why}`)}
+              </Box>
+            )
+          })}
+
+          {heading('Context window')}
+          {s?.contextPercent !== undefined ? (
+            meter('Context', s.contextPercent, 100, `${s.contextPercent}% · ${k(s.contextTokens ?? 0)} of ${k(s.contextWindow)}`, level(s.contextPercent))
+          ) : (
+            note('No reading yet.')
+          )}
+
+          {heading('This session')}
+          {row('Cost', s?.costUsd !== undefined ? usd(s.costUsd) : 'n/a')}
+          {s?.costUsd !== undefined && elapsedHr > 0.05 && row('Pace', `${usd(s.costUsd / elapsedHr)}/h over ${dur(now - s.startedAt)}`)}
+          {row('Turns', String(t.turns))}
+          {row('Input', `${k(t.input)} (cache ${k(t.cacheRead + t.cacheWrite)})`)}
+          {row('Output', k(t.output))}
+          {models.length > 0 && heading('Models this session')}
+          {models.map(([m, x]) => share(shortModel(m), totalAll(x), grand, `${x.turns} turns · ${k(x.output)} out`))}
+        </Box>
+      )
+    }
+
+    // --- Value / Cost: API-equivalent cost, against the plan when its price is set ---
+    const valueTab = () => {
+      const v = hx?.value
+      if (!v) return note('No usage recorded yet; it starts with your next reply.')
+      const { head, lines, dimFrom } = valueLines(v)
+      return (
+        <Box flexDirection="column">
+          {heading(head)}
+          {note(lines[0] ?? '')}
+          {row('API-equivalent so far', lines[1]?.replace(/^API-equivalent so far\s+/, '') ?? '', v.priceUsd > 0 && v.spendUsd >= v.priceUsd ? 'green' : undefined)}
+          {row('Projected this period', lines[2]?.replace(/^Projected this period\s+/, '') ?? '')}
+          {lines.slice(3, dimFrom).map(line => {
+            const m = /^(Break-even|Other apps \(estimated\)|Incl\. other apps)\s+(.*)$/.exec(line)
+            return m ? row(m[1] ?? '', m[2] ?? '') : note(line)
+          })}
+          {v.priceUsd > 0 && (
+            <Box marginTop={1}>
+              {meter('Toward break-even', v.spendUsd, v.priceUsd, `${Math.round((v.spendUsd / v.priceUsd) * 100)}% of ${usd(v.priceUsd)}`, v.spendUsd >= v.priceUsd ? 'green' : 'blue')}
+            </Box>
+          )}
+          <Box flexDirection="column" marginTop={1}>
+            {lines.slice(dimFrom).map(line => note(line))}
+          </Box>
+        </Box>
+      )
+    }
+
+    // --- History: spans, daily chart, models over 30 days ---
+    const historyTab = () => {
+      if (!hx || hx.all.turns === 0) return note('Nothing recorded yet; history starts with your next reply.')
+      const spanText = (x: Totals) => `${usd(x.costUsd)} · ${x.turns} turns · ${k(x.output)} out · ${x.sessions} sess`
+      const maxDayCost = Math.max(0, ...hx.recent.map(r => r.costUsd))
+      const maxDayOut = Math.max(0, ...hx.recent.map(r => r.output))
+      const byCost = maxDayCost > 0
+      const models30 = Object.entries(hx.models30).sort((a, b) => b[1].output - a[1].output)
+      const grand30 = models30.reduce((n, [, m]) => n + totalAll(m), 0)
+      return (
+        <Box flexDirection="column">
+          {note(`Since ${shortDate(hx.firstDay ?? dayOf(now))} · ${hx.sync ? `${hx.machines.length} machine${hx.machines.length === 1 ? '' : 's'}` : 'this machine'}`)}
+          {heading('Totals')}
+          {row('Today', spanText(hx.today))}
+          {row('Last 7 days', spanText(hx.week))}
+          {row('Last 30 days', spanText(hx.month))}
+          {row(`All (≤${KEEP_DAYS}d)`, spanText(hx.all))}
+          {hx.month.activeDays > 0 &&
+            note(`Average per active day (30d): ${usd(hx.month.costUsd / hx.month.activeDays)} · ${k(Math.round(hx.month.output / hx.month.activeDays))} out`)}
+          {heading(`Last ${CHART_DAYS} days (${byCost ? 'cost' : 'output tokens'})`)}
+          {[...hx.recent].reverse().map(r => {
+            const peak = Object.entries(r.peaks)
+              .map(([kind, p]) => `${label(kind)} ${p}%`)
+              .join(', ')
+            return meter(
+              shortDate(r.day),
+              byCost ? r.costUsd : r.output,
+              (byCost ? maxDayCost : maxDayOut) || 1,
+              `${byCost ? usd(r.costUsd) : k(r.output)}${peak ? ` · peak ${peak}` : ''}`,
+            )
+          })}
+          {models30.length > 0 && heading('Models (30 days)')}
+          {models30.map(([m, x]) => share(shortModel(m), totalAll(x), grand30, `${x.turns} turns · ${k(x.output)} out`))}
+        </Box>
+      )
+    }
+
+    // --- Machines: per-machine usage and sync health ---
+    const machinesTab = () => {
+      if (!hx?.sync) return note('Set the sync folder to combine machines.')
+      return (
+        <Box flexDirection="column">
+          {note(`Sync folder: ${hx.sync.folder}`)}
+          {hx.sync.error && note(`Sync problem: ${hx.sync.error}`, 'red')}
+          {heading('Last 30 days')}
+          {hx.machines.map(m =>
+            row(
+              `${m.machine}${m.isThis ? ' (this machine)' : ''}`,
+              `${usd(m.month.costUsd)} · ${m.month.turns} turns${m.updatedAt ? ` · synced ${ago(now - m.updatedAt)} ago` : ''}`,
+            ),
+          )}
+        </Box>
+      )
+    }
 
     return (
       <Box flexDirection="column">
-        <Text bold>Plan limits</Text>
-        {(!s || s.limits.length === 0) && (
-          <Text dimColor>No rate-limit readings: this session isn't reporting plan limits, so no ETA.</Text>
-        )}
-        {s?.limits.map(l => {
-          const eta = projectEta(l, hist[l.kind], now)
-          const reset = l.resetsAt ? Date.parse(l.resetsAt) - now : NaN
-          return (
-            <Box flexDirection="column">
-              <Text>
-                {label(l.kind).padEnd(8)} {bar(l.percentUsed)} {l.percentUsed}%
-              </Text>
-              <Text dimColor>
-                {'         '}
-                {Number.isFinite(reset) ? (reset > 0 ? `resets in ${dur(reset)}` : 'resetting') : ''}
-              </Text>
-              <Text color={eta.kind === 'hit' ? 'red' : undefined} dimColor={eta.kind !== 'hit'}>
-                {'         '}
-                {eta.kind === 'none' && `ETA: ${eta.why}`}
-                {eta.kind === 'safe' && `pace ${eta.ratePerHr.toFixed(1)}%/h: won't hit before reset`}
-                {eta.kind === 'hit' &&
-                  (eta.inMs === 0
-                    ? 'limit reached'
-                    : `pace ${eta.ratePerHr.toFixed(1)}%/h: full ~${clock(eta.at)} (in ${dur(eta.inMs)})` +
-                      (eta.beforeResetBy ? `, ${dur(eta.beforeResetBy)} before reset` : ''))}
-              </Text>
-            </Box>
-          )
-        })}
-        <Text> </Text>
-        <Text bold>Models used (this session)</Text>
-        {models.length === 0 && <Text dimColor>No completed turns yet.</Text>}
-        {models.map(([m, x]) => (
-          <Box flexDirection="column">
-            <Text>
-              {shortModel(m).padEnd(18)} {bar(pct(totalAll(x), grand), 12)} {pct(totalAll(x), grand)}% of tokens
-            </Text>
-            <Text dimColor>
-              {'  '}
-              {x.turns} turns · in {k(x.input)} · out {k(x.output)} · cache {k(x.cacheRead + x.cacheWrite)}
-            </Text>
-          </Box>
-        ))}
-        <Text> </Text>
-        <Text bold>Context window</Text>
-        {s?.contextPercent !== undefined ? (
-          <Text>
-            {bar(s.contextPercent)} {s.contextPercent}% ({k(s.contextTokens ?? 0)} / {k(s.contextWindow)})
+        <Select key="tab" label="View" options={tabs} value={current} onSelect={value => void update($, tab, () => value)} />
+        {hx?.sync?.error && current !== 'machines' && note(`Sync problem: ${hx.sync.error}`, 'red')}
+        {current === 'now' && nowTab()}
+        {current === 'value' && valueTab()}
+        {current === 'history' && historyTab()}
+        {current === 'machines' && machinesTab()}
+        <Box flexDirection="row" justifyContent="space-between" alignItems="center" marginTop={1} columnGap={2}>
+          <Text dimColor size="footnote" wrap="truncate-middle">
+            Settings: {CONFIGURE}
           </Text>
-        ) : (
-          <Text dimColor>No reading yet.</Text>
-        )}
-        <Text> </Text>
-        <Text bold>This session</Text>
-        <Text>
-          Cost      {s?.costUsd !== undefined ? usd(s.costUsd) : 'n/a'}
-          {s?.costUsd !== undefined && elapsedHr > 0.05 ? `  (~${usd(s.costUsd / elapsedHr)}/h over ${dur(now - s.startedAt)})` : ''}
-        </Text>
-        <Text>Turns     {t.turns}</Text>
-        <Text>Input     {k(t.input)}  (cache read {k(t.cacheRead)}, write {k(t.cacheWrite)})</Text>
-        <Text>Output    {k(t.output)}</Text>
-        <Text> </Text>
-        {hx?.value && (
-          <Box flexDirection="column">
-            <Text bold>{valueLines(hx.value).head}</Text>
-            {valueLines(hx.value).lines.map((line, i) => (
-              <Text
-                color={i === 1 && hx.value!.priceUsd > 0 && hx.value!.spendUsd >= hx.value!.priceUsd ? 'green' : undefined}
-                dimColor={i >= valueLines(hx.value!).dimFrom}
-              >
-                {line}
-              </Text>
-            ))}
-            {hx.value.priceUsd > 0 && (
-              <Text>
-                {bar(Math.min(100, (hx.value.spendUsd / hx.value.priceUsd) * 100))}{' '}
-                {Math.round((hx.value.spendUsd / hx.value.priceUsd) * 100)}% of break-even
-              </Text>
-            )}
-            <Text> </Text>
-          </Box>
-        )}
-        <Text bold>
-          History
-          {hx?.firstDay
-            ? ` (since ${hx.firstDay}, ${hx.sync ? `${hx.machines.length} machine${hx.machines.length === 1 ? '' : 's'}` : 'this machine'})`
-            : ''}
-        </Text>
-        {hx?.sync?.error && <Text color="red">Sync problem: {hx.sync.error}</Text>}
-        {(!hx || hx.all.turns === 0) && <Text dimColor>Nothing recorded yet; history starts with your next reply.</Text>}
-        {hx && hx.all.turns > 0 && (
-          <Box flexDirection="column">
-            {span('Today', hx.today)}
-            {span('Last 7 days', hx.week)}
-            {span('Last 30 days', hx.month)}
-            {span(`All (≤${KEEP_DAYS}d)`, hx.all)}
-            {hx.month.activeDays > 0 && (
-              <Text dimColor>
-                Avg per active day (30d): {usd(hx.month.costUsd / hx.month.activeDays)} · {k(Math.round(hx.month.output / hx.month.activeDays))} out
-              </Text>
-            )}
-            <Text> </Text>
-            <Text bold>Last {CHART_DAYS} days ({chartByCost ? 'cost' : 'output tokens'})</Text>
-            {hx.recent.map(r => {
-              const v = chartByCost ? r.costUsd : r.output
-              const max = chartByCost ? maxDayCost : maxDayOut
-              const peak = Object.entries(r.peaks)
-                .map(([kind, p]) => `${label(kind)} ${p}%`)
-                .join(' ')
-              return (
-                <Text dimColor={r.turns === 0}>
-                  {r.day.slice(5)} {bar(pct(v, max), 16)} {chartByCost ? usd(r.costUsd).padStart(8) : k(r.output).padStart(7)}
-                  {peak ? `  peak ${peak}` : ''}
-                </Text>
-              )
-            })}
-            {hx.sync && (
-              <Box flexDirection="column">
-                <Text> </Text>
-                <Text bold>By machine (last 30 days)</Text>
-                {hx.machines.map(m => (
-                  <Text dimColor={m.month.turns === 0}>
-                    {(m.isThis ? '* ' : '  ') + m.machine.slice(0, 16).padEnd(16)} {usd(m.month.costUsd).padStart(9)}{' '}
-                    {String(m.month.turns).padStart(5)} turns {k(m.month.output).padStart(7)} out
-                    {m.updatedAt ? `  synced ${ago(now - m.updatedAt)} ago` : '  (this machine)'}
-                  </Text>
-                ))}
-              </Box>
-            )}
-            <Text> </Text>
-            <Text bold>Models used (last 30 days)</Text>
-            {models30.map(([m, x]) => (
-              <Text>
-                {shortModel(m).padEnd(18)} {bar(pct(totalAll(x), grand30), 12)} {pct(totalAll(x), grand30)}% · {x.turns} turns ·{' '}
-                {k(x.output)} out
-              </Text>
-            ))}
-          </Box>
-        )}
-        <Text> </Text>
-        <Box flexDirection="row">
-          <Text dimColor>Settings: {CONFIGURE} </Text>
           {(e.surface === 'terminal' || e.surface === 'desktop') && (
             <Button key="settings" label="Open settings" onPress={() => openSettings($)} />
           )}
