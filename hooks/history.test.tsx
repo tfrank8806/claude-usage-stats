@@ -53,7 +53,7 @@ test('history sums turns across sessions and days, counts cost once, and prunes 
   let next = usage('claude-opus-5-5', 300)
   on('turn.complete', () => ({ text: '', usage: next }))
 
-  await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+  await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: false }) // day rollover, not the refresh timer
 
   const turn = { answer: '', durationMs: 1, isAborted: false, turnId: 't', reason: 'answer' } as const
   cost = 0.9
@@ -469,4 +469,164 @@ test('value: the pane draws the section on every surface', { options: { subscrip
     expect((await ui.find({ type: 'Text', text: /of break-even$/ }))?.text).toContain('130% of break-even')
     await ui.unmount()
   }
+})
+
+// --- Other apps, estimated from plan-limit movement ---
+const RESETS = '2026-11-20T09:00:00Z'
+const WKEY = `seven_day|${Math.round(Date.parse(RESETS) / 6e5)}`
+const MIN = 60 * 1000
+const otherScenario = async (
+  $: Parameters<TestBody>[0],
+  on: Parameters<TestBody>[1],
+  steps: { at: number; cost: number; pct: number | null; turn?: boolean }[],
+  extra?: (on: Parameters<TestBody>[1]) => void,
+) => {
+  const clock = mock.clock(on, { now: NOON })
+  mock.store(on, {})
+  let cost = 0
+  let pct: number | null = null
+  on('session.usage', () => ({
+    value: {
+      startedAt: NOON,
+      context: { window: 200000 },
+      rateLimits: pct === null ? [] : [{ kind: 'seven_day', percentUsed: pct, resetsAt: RESETS }],
+      cost: { usd: cost },
+    },
+  }))
+  on('session.id', () => ({ value: 'me' }))
+  on('command.register', () => ({ value: { command: 'usage-stats' } }))
+  on('ui.open', () => ({ value: { isPlaced: true } }))
+  on('ui.status', () => ({ value: undefined }))
+  on('session.start', (_, e) => ({ cwd: e.cwd }))
+  on('turn.complete', () => ({ text: '', usage: usage('claude-opus-5-5', 10) }))
+  extra?.(on)
+  let text = ''
+  for (const [i, st] of steps.entries()) {
+    await clock.set(NOON + st.at)
+    cost = st.cost
+    if (st.turn) await $.turn.complete({ answer: '', durationMs: 1, isAborted: false, turnId: 't', reason: 'answer' })
+    pct = st.pct
+    if (i === 0) await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: false })
+    text = ((await $.command.run({ ...HISTORY, args: 'value' })) as { text: string }).text
+  }
+  return text
+}
+// Calibrate on Claude Code alone ($5 over 5 points, minutes apart), then 2 idle hours in
+// which the weekly limit climbs 10 more points with no Claude Code cost.
+const CALIBRATE_THEN_IDLE = [
+  { at: 0, cost: 0, pct: 10 },
+  { at: 1 * MIN, cost: 2, pct: 12, turn: true },
+  { at: 2 * MIN, cost: 5, pct: 15, turn: true },
+  { at: 122 * MIN, cost: 5, pct: 25 },
+]
+
+test('other apps: calibrated rate and the window rise Claude Code does not explain', { options: { subscriptionUsd: 100, billingDay: 5 } }, async ($, on) => {
+  const text = await otherScenario($, on, CALIBRATE_THEN_IDLE)
+  // $1 per point; the window rose 15 points ($15) against $5 of Claude Code: $10 elsewhere.
+  expect(text).toContain('API-equivalent so far  $5.00  = 0.05× the plan')
+  expect(text).toContain('Other apps (estimated) $10.00\n')
+  expect(text).toContain('Incl. other apps       $15.00  = 0.15× the plan')
+  expect(text).toContain('weekly-limit rise not explained by Claude Code (~$1.00 per point)')
+})
+
+test('other apps: calibrating until enough points are seen', async ($, on) => {
+  const text = await otherScenario($, on, CALIBRATE_THEN_IDLE.slice(0, 2))
+  expect(text).toContain('Other apps (estimated) calibrating: 2 of 5 limit points seen')
+  expect(text).not.toContain('Incl. other apps')
+})
+
+test('other apps: never negative when Claude Code explains more than the rise', async ($, on) => {
+  const text = await otherScenario($, on, [
+    ...CALIBRATE_THEN_IDLE.slice(0, 3),
+    { at: 3 * MIN, cost: 9, pct: 16, turn: true }, // $4 more for 1 point: tight, so it recalibrates
+  ])
+  // Calibration: $9 / 6 points = $1.50; window: 6 points × 1.5 = $9 against $9 of Claude Code.
+  expect(text).toContain('Other apps (estimated) $0.00')
+})
+
+test('other apps: no plan-limit readings, no estimate', async ($, on) => {
+  const text = await otherScenario($, on, [{ at: 0, cost: 0, pct: null }])
+  expect(text).not.toContain('Other apps (estimated)')
+  expect(text).toContain('need plan-limit readings (a Claude subscription)')
+})
+
+test(
+  'other apps: synced machines count each window once, at the largest estimate',
+  { options: { syncFolder: '/sync', machineName: 'laptop' } },
+  async ($, on) => {
+    const files: Record<string, string> = {
+      '/sync/usage-desk0001.json': JSON.stringify({
+        version: 1, machineId: 'desk0001', machine: 'desktop', updatedAt: NOON, entries: {},
+        other: {
+          [WKEY]: { kind: 'seven_day', day: '2026-11-16', usd: 7 }, // same window: the larger $10 stands
+          'seven_day|999': { kind: 'seven_day', day: '2026-11-10', usd: 4 }, // a window only it saw
+          'five_hour|998': { kind: 'five_hour', day: '2026-11-16', usd: 50 }, // another kind: not summed in
+        },
+      }),
+    }
+    const text = await otherScenario($, on, CALIBRATE_THEN_IDLE, o => {
+      o('fs.write', (_, e) => ((files[e.path] = e.text), { value: undefined }))
+      o('fs.list', () => ({
+        value: Object.keys(files).map(p => ({ name: p.slice(6), kind: 'file' as const, size: 1, mtimeMs: 0, isLink: false })),
+      }))
+      o('fs.read', (_, e) => ({ value: files[e.path] ?? '' }))
+      o('process.run', () => ({ value: { exitCode: 0, stdout: '', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }))
+      o('env.get', () => ({ value: undefined }))
+    })
+    // Calendar month (no billing day): $10 (this window) + $4 (the desktop's other window).
+    expect(text).toContain('Other apps (estimated) $14.00')
+    // And this machine published its own estimate for the others to read.
+    const mine = Object.entries(files).find(([p]) => !p.includes('desk0001'))
+    expect(JSON.parse(mine![1]).other[WKEY].usd).toBe(10)
+  },
+)
+
+test('other apps: an idle spell is not mistaken for Claude Code at the next reply', async ($, on) => {
+  const text = await otherScenario($, on, [
+    ...CALIBRATE_THEN_IDLE.slice(0, 3), // $1 per point by 2 min
+    // Idle refreshes re-read the same stale reading every minute...
+    ...[3, 4, 5, 6, 7, 8, 9, 10].map(m => ({ at: m * MIN, cost: 5, pct: 15 })),
+    // ...then a $1 reply whose response shows other apps' 9 points as well.
+    { at: 11 * MIN, cost: 6, pct: 25, turn: true },
+  ])
+  // Gap since the last changed reading is 9 minutes, so calibration stays $1 per point:
+  // 15 points × $1 − $6 of Claude Code = $9. (Taken as tight it would be 0.4/pt and $0.)
+  expect(text).toContain('Other apps (estimated) $9.00')
+  expect(text).toContain('~$1.00 per point')
+})
+
+test('settings: the pane shows the command everywhere and a button where it can fill the prompt', async ($, on) => {
+  const fills: string[] = []
+  const toasts: string[] = []
+  on('prompt.fill', (_, e) => (fills.push(e.text), { isFilled: true }))
+  on('ui.toast', (_, e) => (toasts.push(String(e.text)), { value: undefined }))
+  await valueText($, on, STORE)
+  for (const surface of ['terminal', 'desktop', 'vscode', 'mobile'] as const) {
+    const ui = await $.ui.mount({
+      plugin: 'usage-stats',
+      component: 'Pane',
+      requestId: 'usage-stats',
+      surface,
+      props: { title: 'Claude usage', isFocused: false, bodyColumns: 100, placement: 'dock', scroll: { offset: 0, bodyRows: 90 }, view: {} },
+    })
+    expect((await ui.find({ type: 'Text', text: /^Settings: / }))?.text).toContain('/plugin configure usage-stats@claude-usage-stats')
+    if (surface === 'terminal' || surface === 'desktop') {
+      await ui.press({ key: 'settings' })
+      expect(fills.at(-1)).toBe('/plugin configure usage-stats@claude-usage-stats')
+    }
+    await ui.unmount()
+  }
+  expect(fills.length).toBe(2)
+  expect(toasts).toContain('Press Enter to open the usage-stats settings')
+})
+
+test('settings: /usage-stats settings fills the prompt, or names the command where it cannot', async ($, on) => {
+  let isFilled = true
+  on('prompt.fill', () => ({ isFilled }))
+  on('ui.toast', () => ({ value: undefined }))
+  await valueText($, on, STORE)
+  const run = async () => ((await $.command.run({ ...HISTORY, args: 'settings' })) as { text: string }).text
+  expect(await run()).toBe('Press Enter to open the settings.')
+  isFilled = false
+  expect(await run()).toBe('Run /plugin configure usage-stats@claude-usage-stats to open the settings.')
 })

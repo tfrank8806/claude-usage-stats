@@ -41,7 +41,38 @@ export type MachineFile = {
   updatedAt: number
   /** Its store entries, keyed as in the store (`day:<YYYY-MM-DD>:<sessionId>`). */
   entries: Record<string, DayEntry>
+  /** Its estimates of other apps' usage, by `<kind>|<window>`; absent from older versions. */
+  other?: Record<string, OtherEstimate>
 }
+/**
+ * One rate-limit window as this machine saw it: its first and last readings, each with the
+ * Claude Code cost recorded (all synced machines) at that moment.
+ */
+export type LimitWindow = {
+  kind: string
+  /** The window's reset time, rounded to ten minutes: the same window on every machine. */
+  key: string
+  /** Local day of the last reading. */
+  day: string
+  firstPct: number
+  firstCc: number
+  lastPct: number
+  lastCc: number
+  lastAt: number
+}
+/** Dollars of Claude Code cost per point of one limit kind, learned from readings minutes apart. */
+export type Calibration = {
+  costUsd: number
+  points: number
+  last?: { key: string; pct: number; cc: number; at: number }
+}
+/** Estimated usage outside Claude Code (claude.ai, desktop, mobile) within one limit window. */
+export type OtherEstimate = { kind: string; day: string; usd: number }
+/** Where the other-apps estimate stands, for the value section. */
+export type OtherStatus =
+  | { state: 'none' }
+  | { state: 'calibrating'; points: number; needed: number }
+  | { state: 'ok'; kind: string; usdPerPoint: number; usd: number }
 /** One machine's line in the per-machine breakdown. */
 export type MachineRow = {
   machineId: string
@@ -65,6 +96,8 @@ export type History = {
   models30: Record<string, ModelTally>
   machines: MachineRow[]
   sync?: SyncStatus
+  /** Claude Code cost of every retained entry, all machines: the running total limit readings are paired with. */
+  ccTotalUsd: number
   /** API-equivalent cost this billing period (the calendar month without a billing day), against the plan when its price is set. */
   value?: SubscriptionValue
 }
@@ -90,6 +123,8 @@ export type SubscriptionValue = {
   trackedFrom?: string
   /** The day spend reached the price, or at this pace will; absent when it won't this period. */
   breakEven?: { day: string; isProjected: boolean }
+  /** Estimated usage outside Claude Code this period, from plan-limit movement. */
+  other: OtherStatus
 }
 /** What this session has already written to history, so each turn adds only what is new. */
 export type Ledger = { lastCostUsd: number }
