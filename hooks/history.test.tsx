@@ -415,9 +415,43 @@ test('value: a billing day past the month end renews on its last day', { options
   expect(text).toContain('Oct 31 – Nov 29 (day 17 of 30)')
 })
 
-test('value: hidden until a price is set', async ($, on) => {
+test('value: with no price, the API-equivalent cost for the calendar month and a hint', async ($, on) => {
   const text = await valueText($, on, STORE)
-  expect(text).toContain('Set your plan price first')
+  // No billing day either: the period is November. Nov 1 now counts: 999 + 50 + 60 + 20.
+  expect(text).toContain('API-equivalent cost')
+  expect(text).toContain('This month · Nov 1 – Nov 30 (day 16 of 30)')
+  expect(text).toContain('API-equivalent so far  $1129.00\n')
+  // 1129 over 16 days, carried to 30: 1129 + 1129/16 × 14 = 2116.875.
+  expect(text).toContain('Projected this period  $2116.88\n')
+  expect(text).not.toContain('×')
+  expect(text).not.toContain('Break-even')
+  expect(text).toContain('Add your plan price to compare: /plugin configure usage-stats@claude-usage-stats')
+})
+
+test('value: a billing day without a price measures that period', { options: { billingDay: 5 } }, async ($, on) => {
+  const text = await valueText($, on, STORE)
+  expect(text).toContain('Billing period · Nov 5 – Dec 4 (day 12 of 30)')
+  expect(text).toContain('API-equivalent so far  $130.00\n')
+  expect(text).not.toContain('Break-even')
+})
+
+test('value: with no price the pane shows the cost, no break-even bar, on every surface', async ($, on) => {
+  await valueText($, on, STORE)
+  for (const surface of ['terminal', 'desktop', 'vscode', 'mobile'] as const) {
+    const ui = await $.ui.mount({
+      plugin: 'usage-stats',
+      component: 'Pane',
+      requestId: 'usage-stats',
+      surface,
+      props: { title: 'Claude usage', isFocused: false, bodyColumns: 100, placement: 'dock', scroll: { offset: 0, bodyRows: 90 }, view: {} },
+    })
+    expect((await ui.find({ type: 'Text', text: /^API-equivalent cost$/ }))?.text).toBe('API-equivalent cost')
+    expect((await ui.find({ type: 'Text', text: /^API-equivalent so far/ }))?.text).toBe('API-equivalent so far  $1129.00')
+    expect((await ui.find({ type: 'Text', text: /^Add your plan price/ }))?.text).toContain('/plugin configure')
+    expect(await ui.find({ type: 'Text', text: /of break-even$/ })).toBeUndefined()
+    expect(await ui.find({ type: 'Text', text: /^Subscription value/ })).toBeUndefined()
+    await ui.unmount()
+  }
 })
 
 test('value: the pane draws the section on every surface', { options: { subscriptionUsd: 100, billingDay: 5 } }, async ($, on) => {

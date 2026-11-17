@@ -10,7 +10,8 @@ A Claude Code plugin that shows your Claude usage while you work: a side pane, a
 - **Context window**: how full the current context is.
 - **This session**: cost so far and spend per hour, turns, and token totals.
 - **History across sessions**: cost, turns, output tokens and session count for today, the last 7 and 30 days, and everything kept (up to 180 days); a 14-day daily chart with each day's peak rate-limit %; and per-model usage over the last 30 days. `/usage-stats history` prints the summary as text.
-- **Subscription value** (optional): set your plan's monthly price and renewal day, and the pane shows what your recorded usage would have cost at API prices this billing period, as a multiple of the plan, projected to the period's end, with the day it breaks even. `/usage-stats value` prints it. See [Subscription value](#subscription-value).
+- **API-equivalent cost**: what your recorded Claude Code usage would cost at API prices this month (or billing period), so far and projected to its end. `/usage-stats value` prints it.
+- **Subscription value** (optional): set your plan's monthly price and renewal day, and the pane also shows what your recorded usage would have cost at API prices this billing period, as a multiple of the plan, projected to the period's end, with the day it breaks even. `/usage-stats value` prints it. See [Subscription value](#subscription-value).
 - **Across machines** (optional): point every machine at one synced folder and history adds them all up, with a per-machine breakdown. See [Combining machines](#combining-machines).
 
 While a session is open, the pane and status line refresh every minute on their own, limit countdowns, cost and other machines' usage included, with no reply or command needed.
@@ -66,7 +67,7 @@ Set two options (same way as the sync folder: `/plugin configure usage-stats@cla
 echo '{"subscriptionUsd":200,"billingDay":5}' | claude plugin configure usage-stats@claude-usage-stats --values-stdin
 ```
 
-The pane then shows, for the current billing period:
+Without them the pane still shows the **API-equivalent cost** for the calendar month (or for your billing period, if only `billingDay` is set), so far and projected, with a one-line reminder to add your price. With a price set it becomes **Subscription value** and shows, for the current billing period:
 
 - **API-equivalent so far**: the cost Claude Code reports for your recorded usage (all synced machines), and that as a multiple of the plan. Above 1.00×, the plan has cost you less than the same usage on the API would have.
 - **Projected**: the period's pace so far carried to its last day.

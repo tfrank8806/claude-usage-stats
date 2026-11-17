@@ -35,7 +35,7 @@ let lastWrite: { body: string; at: number } | undefined
 const snapshot = atom({ plugin: 'usage-stats', key: 'snapshot' } as const, null, { shape: 'snap-2' })
 const tokens = atom({ plugin: 'usage-stats', key: 'tokens' } as const, ZERO, { shape: 'tok-2' })
 const samples = atom({ plugin: 'usage-stats', key: 'samples' } as const, {}, { shape: 'samp-1' })
-const history = atom({ plugin: 'usage-stats', key: 'history' } as const, null, { shape: 'hist-2' })
+const history = atom({ plugin: 'usage-stats', key: 'history' } as const, null, { shape: 'hist-3' })
 const ledger = atom({ plugin: 'usage-stats', key: 'ledger' } as const, null, { shape: 'ledger-1' })
 const remote = atom({ plugin: 'usage-stats', key: 'remote' } as const, {}, { shape: 'remote-1' })
 const sync = atom({ plugin: 'usage-stats', key: 'sync' } as const, null, { shape: 'sync-1' })
@@ -56,12 +56,27 @@ const dur = (ms: number) => {
 }
 const MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']
 const shortDate = (day: string) => `${MONTHS[Number(day.slice(5, 7)) - 1] ?? day.slice(5, 7)} ${Number(day.slice(8, 10))}`
-/** The value section as lines, for the pane and the text summary alike. */
-const valueLines = (v: SubscriptionValue): { head: string; lines: string[]; multiple: number } => {
-  const multiple = v.spendUsd / v.priceUsd
+const SET_PRICE_HINT = 'Add your plan price to compare: /plugin configure usage-stats@claude-usage-stats'
+/**
+ * The value section as lines, for the pane and the text summary alike: against the plan
+ * when its price is set, else the API-equivalent cost alone. Lines from `dimFrom` on are notes.
+ */
+const valueLines = (v: SubscriptionValue): { head: string; lines: string[]; dimFrom: number } => {
+  const span = `${shortDate(v.periodStart)} – ${shortDate(v.periodEnd)} (day ${v.daysElapsed} of ${v.periodDays})`
+  const notes: string[] = []
+  if (v.trackedFrom) notes.push(`Recorded since ${shortDate(v.trackedFrom)} only; earlier days of this period aren't counted.`)
+  notes.push('Claude Code only: claude.ai, desktop and mobile chats are not included.')
+  if (v.priceUsd <= 0) {
+    const lines = [
+      `${v.isCalendarMonth ? 'This month' : 'Billing period'} · ${span}`,
+      `API-equivalent so far  ${usd(v.spendUsd)}`,
+      `Projected this period  ${usd(v.projectedUsd)}`,
+    ]
+    return { head: 'API-equivalent cost', lines: [...lines, ...notes, SET_PRICE_HINT], dimFrom: lines.length }
+  }
   const lines = [
-    `Plan ${usd(v.priceUsd)}/mo · ${shortDate(v.periodStart)} – ${shortDate(v.periodEnd)} (day ${v.daysElapsed} of ${v.periodDays})`,
-    `API-equivalent so far  ${usd(v.spendUsd)}  = ${multiple.toFixed(2)}× the plan`,
+    `Plan ${usd(v.priceUsd)}/mo · ${span}`,
+    `API-equivalent so far  ${usd(v.spendUsd)}  = ${(v.spendUsd / v.priceUsd).toFixed(2)}× the plan`,
     `Projected this period  ${usd(v.projectedUsd)}  = ${(v.projectedUsd / v.priceUsd).toFixed(2)}×`,
     v.breakEven
       ? v.breakEven.isProjected
@@ -69,9 +84,7 @@ const valueLines = (v: SubscriptionValue): { head: string; lines: string[]; mult
         : `Break-even            reached ${shortDate(v.breakEven.day)}`
       : `Break-even            not this period at this pace (API would cost less)`,
   ]
-  if (v.trackedFrom) lines.push(`Recorded since ${shortDate(v.trackedFrom)} only; earlier days of this period aren't counted.`)
-  lines.push('Claude Code only: claude.ai, desktop and mobile chats are not included.')
-  return { head: 'Subscription value', lines, multiple }
+  return { head: 'Subscription value', lines: [...lines, ...notes], dimFrom: lines.length }
 }
 const ago = (ms: number) => (ms < 6e4 ? '<1m' : dur(ms))
 const two = (n: number) => String(n).padStart(2, '0')
@@ -223,7 +236,15 @@ async function recordTurn($: EngineInterface, u: RawUsage & { model: string }, n
   await $.store.set(key, entry)
 }
 
-type SyncOptions = { folder: string; machineName: string; force: boolean; priceUsd: number; billingDay: number }
+type SyncOptions = {
+  folder: string
+  machineName: string
+  force: boolean
+  priceUsd: number
+  billingDay: number
+  /** False when billingDay is the default: the period is then the calendar month. */
+  isBillingDaySet: boolean
+}
 
 /** A local `YYYY-MM-DD` as a local-midnight Date. */
 const dateOfDay = (day: string) => {
@@ -257,6 +278,7 @@ const subscriptionValue = (
   firstDay: string | undefined,
   priceUsd: number,
   billingDay: number,
+  isBillingDaySet: boolean,
 ): SubscriptionValue => {
   const { startDay, endDay, periodDays } = billingPeriod(today, billingDay)
   const daysElapsed = daysBetween(startDay, today) + 1
@@ -265,7 +287,7 @@ const subscriptionValue = (
   let reachedOn: string | undefined
   for (const d of days) {
     spendUsd += costByDay[d] ?? 0
-    if (!reachedOn && spendUsd >= priceUsd) reachedOn = d
+    if (priceUsd > 0 && !reachedOn && spendUsd >= priceUsd) reachedOn = d
   }
   // Pace over the days actually recorded this period, so a late install doesn't dilute it.
   const trackedFrom = firstDay && firstDay > startDay ? firstDay : undefined
@@ -274,11 +296,22 @@ const subscriptionValue = (
   const projectedUsd = spendUsd + perDay * (periodDays - daysElapsed)
   let breakEven: SubscriptionValue['breakEven']
   if (reachedOn) breakEven = { day: reachedOn, isProjected: false }
-  else if (perDay > 0) {
+  else if (priceUsd > 0 && perDay > 0) {
     const day = addDays(today, Math.ceil((priceUsd - spendUsd) / perDay))
     if (day <= endDay) breakEven = { day, isProjected: true }
   }
-  return { priceUsd, periodStart: startDay, periodEnd: endDay, periodDays, daysElapsed, spendUsd, projectedUsd, trackedFrom, breakEven }
+  return {
+    priceUsd,
+    periodStart: startDay,
+    periodEnd: endDay,
+    periodDays,
+    daysElapsed,
+    isCalendarMonth: !isBillingDaySet,
+    spendUsd,
+    projectedUsd,
+    trackedFrom,
+    breakEven,
+  }
 }
 
 
@@ -497,7 +530,7 @@ async function loadHistory($: EngineInterface, now: number, opts: SyncOptions) {
       }))
       .sort((a, b) => b.month.costUsd - a.month.costUsd),
   ]
-  const value = opts.priceUsd > 0 ? subscriptionValue(costByDay, today, firstDay, opts.priceUsd, opts.billingDay) : undefined
+  const value = subscriptionValue(costByDay, today, firstDay, opts.priceUsd, opts.billingDay, opts.isBillingDaySet)
   const hx: History = { ...spans, firstDay, recent, models30, machines, sync: status, value }
   await update($, history, () => hx)
 }
@@ -521,6 +554,7 @@ export const register: Register = (on, options) => {
     force,
     priceUsd: Math.max(0, Number(options.subscriptionUsd) || 0),
     billingDay: Math.min(31, Math.max(1, Math.round(Number(options.billingDay) || 1))),
+    isBillingDaySet: Number(options.billingDay) > 1,
   })
 
   on('session.start', async ($, e, next) => {
@@ -555,7 +589,7 @@ export const register: Register = (on, options) => {
     await $.ui.open({ id: PANE, title: 'Claude usage' })
     if (e.args.trim() === 'value') {
       const v = (await read($, history))?.value
-      if (!v) return { text: 'Set your plan price first: the subscriptionUsd option (and billingDay, the day it renews).' }
+      if (!v) return { text: 'No usage recorded yet; it starts with your next reply.' }
       const { head, lines } = valueLines(v)
       return { text: [head, ...lines].join('\n') }
     }
@@ -721,19 +755,21 @@ export const register: Register = (on, options) => {
         <Text> </Text>
         {hx?.value && (
           <Box flexDirection="column">
-            <Text bold>Subscription value</Text>
+            <Text bold>{valueLines(hx.value).head}</Text>
             {valueLines(hx.value).lines.map((line, i) => (
               <Text
-                color={i === 1 ? (hx.value!.spendUsd >= hx.value!.priceUsd ? 'green' : undefined) : undefined}
-                dimColor={i >= 4}
+                color={i === 1 && hx.value!.priceUsd > 0 && hx.value!.spendUsd >= hx.value!.priceUsd ? 'green' : undefined}
+                dimColor={i >= valueLines(hx.value!).dimFrom}
               >
                 {line}
               </Text>
             ))}
-            <Text>
-              {bar(Math.min(100, (hx.value.spendUsd / hx.value.priceUsd) * 100))}{' '}
-              {Math.round((hx.value.spendUsd / hx.value.priceUsd) * 100)}% of break-even
-            </Text>
+            {hx.value.priceUsd > 0 && (
+              <Text>
+                {bar(Math.min(100, (hx.value.spendUsd / hx.value.priceUsd) * 100))}{' '}
+                {Math.round((hx.value.spendUsd / hx.value.priceUsd) * 100)}% of break-even
+              </Text>
+            )}
             <Text> </Text>
           </Box>
         )}

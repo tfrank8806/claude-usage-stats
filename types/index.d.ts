@@ -65,12 +65,12 @@ export type History = {
   models30: Record<string, ModelTally>
   machines: MachineRow[]
   sync?: SyncStatus
-  /** Subscription value for the current billing period; absent until a plan price is set. */
+  /** API-equivalent cost this billing period (the calendar month without a billing day), against the plan when its price is set. */
   value?: SubscriptionValue
 }
 /**
- * What the subscription is worth this billing period: the API-equivalent cost of the
- * recorded usage set against the plan's price. Days are local `YYYY-MM-DD`.
+ * The API-equivalent cost of recorded usage this billing period, set against the plan's
+ * price when one is set (`priceUsd` 0 means none). Days are local `YYYY-MM-DD`.
  */
 export type SubscriptionValue = {
   priceUsd: number
@@ -80,6 +80,8 @@ export type SubscriptionValue = {
   periodDays: number
   /** Days of the period up to and including today. */
   daysElapsed: number
+  /** True when no billing day is set, so the period is simply the calendar month. */
+  isCalendarMonth: boolean
   /** API-equivalent cost recorded so far this period, all synced machines. */
   spendUsd: number
   /** spendUsd at this period's pace so far, carried to the period's end. */
