@@ -10,6 +10,10 @@ import type {
   MachineFile,
   MachineRow,
   ModelTally,
+  OtherEstimate,
+  OtherStatus,
+  LimitWindow,
+  Calibration,
   Sample,
   Snapshot,
   SubscriptionValue,
@@ -35,7 +39,7 @@ let lastWrite: { body: string; at: number } | undefined
 const snapshot = atom({ plugin: 'usage-stats', key: 'snapshot' } as const, null, { shape: 'snap-2' })
 const tokens = atom({ plugin: 'usage-stats', key: 'tokens' } as const, ZERO, { shape: 'tok-2' })
 const samples = atom({ plugin: 'usage-stats', key: 'samples' } as const, {}, { shape: 'samp-1' })
-const history = atom({ plugin: 'usage-stats', key: 'history' } as const, null, { shape: 'hist-3' })
+const history = atom({ plugin: 'usage-stats', key: 'history' } as const, null, { shape: 'hist-4' })
 const ledger = atom({ plugin: 'usage-stats', key: 'ledger' } as const, null, { shape: 'ledger-1' })
 const remote = atom({ plugin: 'usage-stats', key: 'remote' } as const, {}, { shape: 'remote-1' })
 const sync = atom({ plugin: 'usage-stats', key: 'sync' } as const, null, { shape: 'sync-1' })
@@ -63,28 +67,49 @@ const SET_PRICE_HINT = 'Add your plan price to compare: /plugin configure usage-
  */
 const valueLines = (v: SubscriptionValue): { head: string; lines: string[]; dimFrom: number } => {
   const span = `${shortDate(v.periodStart)} – ${shortDate(v.periodEnd)} (day ${v.daysElapsed} of ${v.periodDays})`
+  const hasPrice = v.priceUsd > 0
+  const times = (n: number) => (hasPrice ? `  = ${(n / v.priceUsd).toFixed(2)}×${n === v.spendUsd ? ' the plan' : ''}` : '')
+  const o = v.other
+  const otherLines =
+    o.state === 'ok'
+      ? [
+          `Other apps (estimated) ${usd(o.usd)}`,
+          `Incl. other apps       ${usd(v.spendUsd + o.usd)}${hasPrice ? `  = ${((v.spendUsd + o.usd) / v.priceUsd).toFixed(2)}× the plan` : ''}`,
+        ]
+      : o.state === 'calibrating'
+        ? [`Other apps (estimated) calibrating: ${o.points} of ${o.needed} limit points seen`]
+        : []
   const notes: string[] = []
   if (v.trackedFrom) notes.push(`Recorded since ${shortDate(v.trackedFrom)} only; earlier days of this period aren't counted.`)
-  notes.push('Claude Code only: claude.ai, desktop and mobile chats are not included.')
-  if (v.priceUsd <= 0) {
-    const lines = [
-      `${v.isCalendarMonth ? 'This month' : 'Billing period'} · ${span}`,
-      `API-equivalent so far  ${usd(v.spendUsd)}`,
-      `Projected this period  ${usd(v.projectedUsd)}`,
-    ]
-    return { head: 'API-equivalent cost', lines: [...lines, ...notes, SET_PRICE_HINT], dimFrom: lines.length }
+  if (o.state === 'ok') {
+    notes.push(
+      `Other apps = ${o.kind === 'seven_day' ? 'weekly' : '5-hour'}-limit rise not explained by Claude Code (~${usd(o.usdPerPoint)} per point); a rough estimate.`,
+    )
+  } else if (o.state === 'calibrating') {
+    notes.push('Other apps are estimated from plan-limit movement once enough Claude Code use has been seen.')
+  } else {
+    notes.push('Claude Code only: claude.ai, desktop and mobile chats need plan-limit readings (a Claude subscription).')
   }
   const lines = [
-    `Plan ${usd(v.priceUsd)}/mo · ${span}`,
-    `API-equivalent so far  ${usd(v.spendUsd)}  = ${(v.spendUsd / v.priceUsd).toFixed(2)}× the plan`,
-    `Projected this period  ${usd(v.projectedUsd)}  = ${(v.projectedUsd / v.priceUsd).toFixed(2)}×`,
-    v.breakEven
-      ? v.breakEven.isProjected
-        ? `Break-even            ~${shortDate(v.breakEven.day)} at this pace`
-        : `Break-even            reached ${shortDate(v.breakEven.day)}`
-      : `Break-even            not this period at this pace (API would cost less)`,
+    `${hasPrice ? `Plan ${usd(v.priceUsd)}/mo` : v.isCalendarMonth ? 'This month' : 'Billing period'} · ${span}`,
+    `API-equivalent so far  ${usd(v.spendUsd)}${times(v.spendUsd)}`,
+    `Projected this period  ${usd(v.projectedUsd)}${hasPrice ? `  = ${(v.projectedUsd / v.priceUsd).toFixed(2)}×` : ''}`,
+    ...(hasPrice
+      ? [
+          v.breakEven
+            ? v.breakEven.isProjected
+              ? `Break-even            ~${shortDate(v.breakEven.day)} at this pace`
+              : `Break-even            reached ${shortDate(v.breakEven.day)}`
+            : `Break-even            not this period at this pace (API would cost less)`,
+        ]
+      : []),
+    ...otherLines,
   ]
-  return { head: 'Subscription value', lines: [...lines, ...notes], dimFrom: lines.length }
+  return {
+    head: hasPrice ? 'Subscription value' : 'API-equivalent cost',
+    lines: [...lines, ...notes, ...(hasPrice ? [] : [SET_PRICE_HINT])],
+    dimFrom: lines.length,
+  }
 }
 const ago = (ms: number) => (ms < 6e4 ? '<1m' : dur(ms))
 const two = (n: number) => String(n).padStart(2, '0')
@@ -209,6 +234,137 @@ async function recordSamples($: EngineInterface, limits: Limit[], now: number) {
   })
 }
 
+// --- Other apps (claude.ai, desktop, mobile), estimated from plan-limit movement ---
+//
+// The 5-hour and weekly limits are account-wide, so chats in other apps move them too.
+// Readings minutes apart during active Claude Code use teach roughly how many dollars of
+// Claude Code cost move a limit one point; within a window, the rise not explained by
+// Claude Code cost (all synced machines) is then other apps' usage. Rough by design.
+const LIMIT_KINDS = ['seven_day', 'five_hour'] // preference order for the estimate
+const TIGHT_MS = 3 * 60 * 1000 // readings this close are taken as Claude Code alone
+const MIN_POINTS = 5 // points of calibration before an estimate is shown
+const FORGET_AT = 100 // past this many points, halve the calibration so it follows changes
+const WINDOW_KEEP_MS = 40 * 864e5
+const WINDOWS_KEY = 'limitWindows'
+const CAL_KEY = 'limitCal'
+
+/** A window's reset time rounded to ten minutes, so every reading and machine agrees on it. */
+const windowKey = (resetsAt: string | undefined) => {
+  const t = resetsAt ? Date.parse(resetsAt) : NaN
+  return Number.isFinite(t) ? String(Math.round(t / 6e5)) : undefined
+}
+const asNumberRecord = <T,>(v: unknown, ok: (x: unknown) => x is T): Record<string, T> => {
+  const out: Record<string, T> = {}
+  if (isRecord(v)) for (const [k2, x] of Object.entries(v)) if (ok(x)) out[k2] = x
+  return out
+}
+const isWindow = (x: unknown): x is LimitWindow =>
+  isRecord(x) && typeof x.kind === 'string' && typeof x.key === 'string' && typeof x.firstPct === 'number' &&
+  typeof x.lastPct === 'number' && typeof x.firstCc === 'number' && typeof x.lastCc === 'number' &&
+  typeof x.lastAt === 'number' && typeof x.day === 'string'
+const isCalibration = (x: unknown): x is Calibration =>
+  isRecord(x) && typeof x.costUsd === 'number' && typeof x.points === 'number'
+const isEstimate = (x: unknown): x is OtherEstimate =>
+  isRecord(x) && typeof x.kind === 'string' && typeof x.day === 'string' && typeof x.usd === 'number'
+
+/**
+ * Folds one reading into a window and a calibration; undefined when it is the same reading
+ * again. A reading only changes when Claude Code gets an API response: an idle refresh
+ * re-reads the last one, so it must not move `last.at` on, or the first reply after an
+ * idle spell (other apps' usage and all) would look minutes after the one before it.
+ */
+const foldReading = (
+  windows: Record<string, LimitWindow>,
+  cals: Record<string, Calibration>,
+  r: { kind: string; key: string; pct: number; cc: number; at: number; day: string },
+) => {
+  const prevLast = cals[r.kind]?.last
+  if (prevLast && prevLast.key === r.key && prevLast.pct === r.pct && prevLast.cc === r.cc && windows[`${r.kind}|${r.key}`]) {
+    return undefined
+  }
+  const wk = `${r.kind}|${r.key}`
+  const w = windows[wk]
+  const nextWindows = {
+    ...windows,
+    [wk]: w
+      ? { ...w, day: r.day, lastPct: r.pct, lastCc: r.cc, lastAt: r.at }
+      : { kind: r.kind, key: r.key, day: r.day, firstPct: r.pct, firstCc: r.cc, lastPct: r.pct, lastCc: r.cc, lastAt: r.at },
+  }
+  const c = cals[r.kind] ?? { costUsd: 0, points: 0 }
+  let { costUsd, points } = c
+  const l = c.last
+  if (l && l.key === r.key && r.at - l.at <= TIGHT_MS && r.pct >= l.pct && r.cc >= l.cc) {
+    costUsd += r.cc - l.cc
+    points += r.pct - l.pct
+    if (points > FORGET_AT) {
+      costUsd /= 2
+      points /= 2
+    }
+  }
+  return {
+    windows: nextWindows,
+    cals: { ...cals, [r.kind]: { costUsd, points, last: { key: r.key, pct: r.pct, cc: r.cc, at: r.at } } },
+  }
+}
+
+/** This machine's estimate for each window of each calibrated kind. */
+const estimatesOf = (windows: Record<string, LimitWindow>, cals: Record<string, Calibration>) => {
+  const out: Record<string, OtherEstimate> = {}
+  for (const [wk, w] of Object.entries(windows)) {
+    const c = cals[w.kind]
+    if (!c || c.points < MIN_POINTS || c.costUsd <= 0) continue
+    const perPoint = c.costUsd / c.points
+    const usd = Math.max(0, perPoint * (w.lastPct - w.firstPct) - (w.lastCc - w.firstCc))
+    out[wk] = { kind: w.kind, day: w.day, usd }
+  }
+  return out
+}
+
+/** The other-apps figure for a period, from every machine's estimates (each window once). */
+const otherFor = (
+  merged: Record<string, OtherEstimate>,
+  cals: Record<string, Calibration>,
+  hasWindows: boolean,
+  from: string,
+  to: string,
+): OtherStatus => {
+  const kind = LIMIT_KINDS.find(kd => Object.values(merged).some(e => e.kind === kd))
+  if (!kind) {
+    if (!hasWindows) return { state: 'none' }
+    const best = Math.max(0, ...LIMIT_KINDS.map(kd => cals[kd]?.points ?? 0))
+    return { state: 'calibrating', points: Math.floor(best * 10) / 10, needed: MIN_POINTS }
+  }
+  let usd = 0
+  for (const e of Object.values(merged)) if (e.kind === kind && e.day >= from && e.day <= to) usd += e.usd
+  const c = cals[kind]
+  return { state: 'ok', kind, usdPerPoint: c && c.points > 0 ? c.costUsd / c.points : 0, usd }
+}
+
+// Record a plan-limit reading against the Claude Code cost recorded so far.
+async function recordLimits($: EngineInterface, limits: Limit[], now: number, sessionCostUsd: number) {
+  const readings = limits.filter(l => LIMIT_KINDS.includes(l.kind) && windowKey(l.resetsAt))
+  if (readings.length === 0) return
+  const hx = await read($, history)
+  const led = await read($, ledger)
+  // Recorded cost, plus what this session has spent since its last recorded turn.
+  const cc = (hx?.ccTotalUsd ?? 0) + Math.max(0, sessionCostUsd - (led?.lastCostUsd ?? sessionCostUsd))
+  let windows = asNumberRecord(await $.store.get(WINDOWS_KEY), isWindow)
+  let cals = asNumberRecord(await $.store.get(CAL_KEY), isCalibration)
+  let isChanged = false
+  for (const l of readings) {
+    const key = windowKey(l.resetsAt)
+    if (!key) continue
+    const folded = foldReading(windows, cals, { kind: l.kind, key, pct: l.percentUsed, cc, at: now, day: dayOf(now) })
+    if (!folded) continue
+    ;({ windows, cals } = folded)
+    isChanged = true
+  }
+  if (!isChanged) return
+  for (const [wk, w] of Object.entries(windows)) if (now - w.lastAt > WINDOW_KEEP_MS) delete windows[wk]
+  await $.store.set(WINDOWS_KEY, windows)
+  await $.store.set(CAL_KEY, cals)
+}
+
 // Add one turn to this session's entry for today. Each session writes only its own
 // key, so sessions running side by side never overwrite each other.
 async function recordTurn($: EngineInterface, u: RawUsage & { model: string }, now: number) {
@@ -279,7 +435,7 @@ const subscriptionValue = (
   priceUsd: number,
   billingDay: number,
   isBillingDaySet: boolean,
-): SubscriptionValue => {
+): Omit<SubscriptionValue, 'other'> => {
   const { startDay, endDay, periodDays } = billingPeriod(today, billingDay)
   const daysElapsed = daysBetween(startDay, today) + 1
   const days = Object.keys(costByDay).filter(d => d >= startDay && d <= today).sort()
@@ -362,6 +518,7 @@ const asMachineFile = (v: unknown): MachineFile | undefined => {
     machine: typeof v.machine === 'string' ? v.machine : v.machineId,
     updatedAt: typeof v.updatedAt === 'number' ? v.updatedAt : 0,
     entries,
+    other: asNumberRecord(v.other, isEstimate),
   }
 }
 
@@ -370,6 +527,7 @@ const asMachineFile = (v: unknown): MachineFile | undefined => {
 async function syncFolder(
   $: EngineInterface,
   own: Record<string, DayEntry>,
+  ownOther: Record<string, OtherEstimate>,
   opts: SyncOptions,
   now: number,
 ) {
@@ -384,9 +542,9 @@ async function syncFolder(
   if (!isDue) return
   const id = await machineIdOf($)
   const machine = await machineNameOf($, opts.machineName, id)
-  const file: MachineFile = { version: 1, machineId: id, machine, updatedAt: now, entries: own }
+  const file: MachineFile = { version: 1, machineId: id, machine, updatedAt: now, entries: own, other: ownOther }
   const ownPath = `${where.dir}${where.sep}usage-${id}.json`
-  const body = `${ownPath}\n${machine}\n${JSON.stringify(own)}`
+  const body = `${ownPath}\n${machine}\n${JSON.stringify(own)}\n${JSON.stringify(ownOther)}`
   const isUnchanged = !opts.force && lastWrite?.body === body && now - lastWrite.at < HEARTBEAT_MS
   try {
     if (!isUnchanged) {
@@ -446,8 +604,19 @@ async function loadHistory($: EngineInterface, now: number, opts: SyncOptions) {
     own[key] = entry
   }
 
-  await syncFolder($, own, opts, now)
+  const windows = asNumberRecord(await $.store.get(WINDOWS_KEY), isWindow)
+  const cals = asNumberRecord(await $.store.get(CAL_KEY), isCalibration)
+  const ownOther = estimatesOf(windows, cals)
+  await syncFolder($, own, ownOther, opts, now)
   const others = (await read($, remote)) ?? {}
+  // Every machine's estimates, each window once: the largest any machine saw of it.
+  const mergedOther: Record<string, OtherEstimate> = { ...ownOther }
+  for (const f of Object.values(others)) {
+    for (const [wk, e] of Object.entries(f.other ?? {})) {
+      const mine = mergedOther[wk]
+      if (!mine || e.usd > mine.usd) mergedOther[wk] = e
+    }
+  }
   const status = (await read($, sync)) ?? undefined
   const id = await machineIdOf($)
   const name = status ? await machineNameOf($, opts.machineName, id) : 'this machine'
@@ -476,7 +645,9 @@ async function loadHistory($: EngineInterface, now: number, opts: SyncOptions) {
   })
 
   const costByDay: Record<string, number> = {}
+  let ccTotalUsd = 0
   for (const { entry, machineId } of all.values()) {
+    ccTotalUsd += entry.costUsd
     if (!firstDay || entry.day < firstDay) firstDay = entry.day
     costByDay[entry.day] = (costByDay[entry.day] ?? 0) + entry.costUsd
     const inSpan = {
@@ -530,8 +701,10 @@ async function loadHistory($: EngineInterface, now: number, opts: SyncOptions) {
       }))
       .sort((a, b) => b.month.costUsd - a.month.costUsd),
   ]
-  const value = subscriptionValue(costByDay, today, firstDay, opts.priceUsd, opts.billingDay, opts.isBillingDaySet)
-  const hx: History = { ...spans, firstDay, recent, models30, machines, sync: status, value }
+  const base = subscriptionValue(costByDay, today, firstDay, opts.priceUsd, opts.billingDay, opts.isBillingDaySet)
+  const other = otherFor(mergedOther, cals, Object.keys(windows).length > 0, base.periodStart, today)
+  const value = { ...base, other }
+  const hx: History = { ...spans, firstDay, recent, models30, machines, sync: status, value, ccTotalUsd }
   await update($, history, () => hx)
 }
 
@@ -543,6 +716,7 @@ async function refresh($: EngineInterface, opts: SyncOptions) {
   const s = toSnapshot(await $.session.usage(), prev?.startedAt ?? now)
   await update($, snapshot, () => s)
   await recordSamples($, s.limits, now)
+  await recordLimits($, s.limits, now, s.costUsd ?? 0)
   await loadHistory($, now, opts)
   $.ui.status(statusText(s, (await read($, samples)) ?? {}, now))
 }
@@ -569,6 +743,7 @@ export const register: Register = (on, options) => {
     // Cost already on the ledger (a resumed session) was counted when it was spent.
     await update($, ledger, l => l ?? { lastCostUsd: u.cost?.usd ?? 0 })
     await recordSamples($, s.limits, now)
+    await recordLimits($, s.limits, now, s.costUsd ?? 0)
     await loadHistory($, now, syncOpts(true))
     $.ui.status(statusText(s, (await read($, samples)) ?? {}, now))
     // Keep refreshing while the session is open; a reload drops this timer and starts a new one.
@@ -585,6 +760,7 @@ export const register: Register = (on, options) => {
     const s = toSnapshot(await $.session.usage(), now)
     await update($, snapshot, () => s)
     await recordSamples($, s.limits, now)
+    await recordLimits($, s.limits, now, s.costUsd ?? 0)
     await loadHistory($, now, syncOpts(true))
     await $.ui.open({ id: PANE, title: 'Claude usage' })
     if (e.args.trim() === 'value') {
@@ -628,6 +804,7 @@ export const register: Register = (on, options) => {
     const s = toSnapshot(e, prev?.startedAt ?? now)
     await update($, snapshot, () => s)
     await recordSamples($, s.limits, now)
+    await recordLimits($, s.limits, now, s.costUsd ?? 0)
     const hist = (await read($, samples)) ?? {}
     $.ui.status(statusText(s, hist, now))
     if (e.changed.includes('rateLimits')) {

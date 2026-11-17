@@ -73,7 +73,13 @@ Without them the pane still shows the **API-equivalent cost** for the calendar m
 - **Projected**: the period's pace so far carried to its last day.
 - **Break-even**: the day spend reached the plan price, or the day it will at this pace.
 
-Read it as an upper bound on value, with two caveats: it counts Claude Code only (claude.ai, desktop and mobile chats are not included, so it understates your use), and it prices usage you might not have bought at API rates (so it overstates what you'd actually spend without the plan). Days before the plugin was installed aren't counted; the pane says when the period is only partly recorded and paces on the recorded days.
+### Other apps (estimated)
+
+claude.ai, the desktop and mobile apps don't report usage to plugins, but on a Claude subscription the 5-hour and weekly limits are shared with them. The plugin learns roughly how many dollars of Claude Code cost move a limit one point, from readings minutes apart while you use Claude Code; within each limit window, the rise Claude Code doesn't explain is counted as **Other apps (estimated)** and shown on its own line, plus a total including it. It prefers the weekly window, falling back to the 5-hour one. Until it has seen 5 points of calibration it says "calibrating". Synced machines share their estimates and each window is counted once.
+
+It is rough: models use limits at different rates, readings are coarse, and a window in which Claude Code made no request at all on any machine is never seen. It is never mixed into the measured figures.
+
+Read it as an upper bound on value, with two caveats: the measured figures count Claude Code only (other apps appear only as the separate estimate above), and it prices usage you might not have bought at API rates (so it overstates what you'd actually spend without the plan). Days before the plugin was installed aren't counted; the pane says when the period is only partly recorded and paces on the recorded days.
 
 ## Keeping the plugin up to date
 
